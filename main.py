@@ -70,6 +70,10 @@ def run_ffmpeg(input_path: str, output_path: str):
         "-hide_banner",  # suppress banner
         "-stats_period",
         "1",  # Only show stats every second
+        "-analyzeduration",
+        "50G",
+        "-probesize",
+        "5G",
         "-i",
         input_path,
         "-filter_complex",
@@ -106,6 +110,10 @@ def get_stream_info(file_path: str) -> list[str]:
         "ffprobe",
         "-v",
         "error",
+        "-analyzeduration",
+        "50G",
+        "-probesize",
+        "5G",
         "-select_streams",
         "s",
         "-show_entries",
