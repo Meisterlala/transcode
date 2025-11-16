@@ -9,8 +9,11 @@ from pathlib import Path
 
 import requests
 
+# Directory to monitor for input files
 INPUT_DIR = os.environ.get("INPUT_DIR", "in_test")
+# URL to Jellyfin server
 JELLYFIN_URL = os.environ.get("JELLYFIN_URL", "http://jellyfin:8096")
+# Jellyfin API key
 JELLYFIN_API = os.environ.get("JELLYFIN_API", "")
 
 ENDING = " - Transcoded"
@@ -28,11 +31,16 @@ def main():
         print("FFmpeg not found!")
         sys.exit(1)
 
-    do_jellyfin = JELLYFIN_API != ""
+    # Clean up any bad transcodes on startup
+    try:
+        cleanup_bad_transcodes()
+    except Exception:
+        print("Failed to cleanup bad transcodes on startup.")
 
     while True:
         if process_new():
-            if do_jellyfin:
+            # Update Jellyfin
+            if JELLYFIN_API != "":
                 print("Updating Jellyfin libraries...")
                 try:
                     update_all_libraries(JELLYFIN_URL, JELLYFIN_API)
@@ -243,6 +251,18 @@ def delete_transcode(file: Path):
     if processed_path.exists():
         processed_path.unlink()
         print(f"Deleted transcoded file: {processed_path}")
+
+
+def cleanup_bad_transcodes():
+    all_files = get_all_files()
+    for file_path in all_files:
+        dir_name = file_path.parent
+        name = file_path.stem
+        processed_name = f"{name}{ENDING}.{TARGET_FROMAT}"
+        processed_path = dir_name / processed_name
+        if processed_path.exists() and processed_path.stat().st_size < 100:
+            print(f"Deleting bad transcode because its empty: {processed_path}")
+            processed_path.unlink()
 
 
 if __name__ == "__main__":
