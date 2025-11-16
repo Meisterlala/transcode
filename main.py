@@ -70,6 +70,9 @@ def run_ffmpeg(input_path: str, output_path: str):
         "-hide_banner",  # suppress banner
         "-stats_period",
         "1",  # Only show stats every second
+        "-progress",
+        "pipe:1",  # progress to stdout
+        "-nostats",
         "-analyzeduration",
         "50G",
         "-probesize",
