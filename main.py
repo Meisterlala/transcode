@@ -7,7 +7,12 @@ import sys
 import time
 from pathlib import Path
 
+import requests
+
 INPUT_DIR = os.environ.get("INPUT_DIR", "in_test")
+JELLYFIN_URL = os.environ.get("JELLYFIN_URL", "http://jellyfin:8096")
+JELLYFIN_API = os.environ.get("JELLYFIN_API", "")
+
 ENDING = " - Transcoded"
 TARGET_FROMAT = "mp4"
 ALLOWED_EXTENSIONS = ["mp4", "mkv"]
@@ -23,9 +28,18 @@ def main():
         print("FFmpeg not found!")
         sys.exit(1)
 
+    do_jellyfin = JELLYFIN_API != ""
+
     while True:
         if process_new():
+            if do_jellyfin:
+                print("Updating Jellyfin libraries...")
+                try:
+                    update_all_libraries(JELLYFIN_URL, JELLYFIN_API)
+                except Exception as e:
+                    print("Failed to update Jellyfin libraries.", e)
             time.sleep(1)  # Short sleep if a file was processed
+
         time.sleep(60)  # Sleep before checking for new files
 
 
@@ -175,6 +189,50 @@ def remove_files_if_procesed(file_list: list[Path]) -> list[Path]:
         if not processed_path.exists():
             unprocessed_files.append(file_path)
     return unprocessed_files
+
+
+# Update jellyfin registries
+def update_all_libraries(jellyfin_url: str, api_key: str):
+    """
+    Fetch all libraries from Jellyfin and trigger a scan for each.
+
+    :param jellyfin_url: Base URL of the Jellyfin server (e.g., http://server_ip)
+    :param api_key: Your Jellyfin API key
+    """
+    headers = {"X-Emby-Token": api_key}
+
+    # Fetch libraries
+    try:
+        resp = requests.get(f"{jellyfin_url}/Library/VirtualFolders", headers=headers)
+        resp.raise_for_status()
+        libraries = resp.json()
+    except Exception as e:
+        print(f"Failed to fetch libraries: {e}")
+        return
+
+    if not libraries:
+        print("No libraries found.")
+        return
+
+    # Trigger a scan for each library
+    for lib in libraries:
+        lib_id = lib.get("ItemId")
+        lib_name = lib.get("Name", "Unknown")
+        if not lib_id:
+            print(f"Skipping library {lib_name} (no ID)")
+            continue
+
+        print(f"Starting scan for library '{lib_name}' (ID: {lib_id})...")
+        try:
+            scan_url = (
+                f"{jellyfin_url}/Items/{lib_id}/Refresh"
+                "?Recursive=true&ImageRefreshMode=Default&MetadataRefreshMode=Default"
+                "&ReplaceAllImages=false&RegenerateTrickplay=false&ReplaceAllMetadata=false"
+            )
+            requests.post(scan_url, headers=headers)
+            print(f"Scan triggered for '{lib_name}'.")
+        except Exception as e:
+            print(f"Failed to scan library {lib_name}: {e}")
 
 
 def delete_transcode(file: Path):
