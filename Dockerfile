@@ -7,4 +7,4 @@ RUN apt-get update && apt-get install -y ffmpeg && rm -rf /var/lib/apt/lists/*
 COPY main.py .
 
 # Run the script
-CMD ["python", "main.py"]
+CMD ["python", "-u", "main.py"]
