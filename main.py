@@ -116,8 +116,8 @@ def run_ffmpeg(input_path: str, output_path: str):
         "slow",
         "-crf",
         "23",  # (lower = better quality)
-        "-t",
-        "20",
+        # "-t",
+        # "20",
         "-c:a",
         "aac",
         "-movflags",
