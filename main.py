@@ -17,6 +17,7 @@ JELLYFIN_URL = os.environ.get("JELLYFIN_URL", "http://jellyfin:8096")
 JELLYFIN_API = os.environ.get("JELLYFIN_API", "")
 
 ENDING = " - Transcoded"
+ENDING_ORG = " - Original"
 TARGET_FROMAT = "mp4"
 ALLOWED_EXTENSIONS = ["mp4", "mkv"]
 DISALLOWED_ENDINGS = [ENDING]
@@ -69,6 +70,7 @@ def process_new() -> bool:
 def run_ffmpeg(input_path: str, output_path: str):
     # Get subtitle stream count
     streams = get_stream_info(input_path)
+    streams = streams[:3]  # Limit to max 3 subtitle streams
     print("Subtitle streams found:", streams)
 
     # Build overlay filter
