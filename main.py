@@ -25,9 +25,7 @@ DISALLOWED_ENDINGS = [ENDING]
 
 def main():
     try:
-        result = subprocess.run(["ffmpeg", "-version"], capture_output=True, text=True)
-        print("FFmpeg version:")
-        print(result.stdout.split("\n")[0])  # First line has version
+        _ = subprocess.run(["ffmpeg", "-version"], capture_output=False, text=True)
     except FileNotFoundError:
         print("FFmpeg not found!")
         sys.exit(1)
