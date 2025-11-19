@@ -94,13 +94,14 @@ def run_ffmpeg(input_path: str, output_path: str):
         "1",  # Only show stats every second
         "-progress",
         "pipe:1",  # progress to stdout
-        "-nostats",
-        "-analyzeduration",
+        "-nostats",  # suppress periodic stats, we use the progress for that
+        "-analyzeduration",  # increase analyze duration
         "50G",
-        "-probesize",
+        "-probesize",  # increase probe size
         "50M",
         "-i",
         input_path,
+        # Generate a complex filter
         "-filter_complex",
         ";".join(filters),
         *maps,
@@ -109,15 +110,15 @@ def run_ffmpeg(input_path: str, output_path: str):
         # "-map",
         # "0:s?",  # subtitles, optional if they exist
         "-c:v",
-        "libx264",
-        "-preset",
-        "slow",
+        "libx264",  # Use H.264 codec
+        # "-preset", # preset can be adjusted for speed vs quality
+        # "slow",
         "-crf",
         "23",  # (lower = better quality)
         # "-t",
         # "20",
         "-c:a",
-        "aac",
+        "aac",  # Use AAC codec for audio
         "-movflags",
         "+faststart",  # for MP4 streaming,
         "-tune",
