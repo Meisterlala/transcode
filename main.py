@@ -8,6 +8,7 @@ import time
 from pathlib import Path
 
 import requests
+from prometheus_client import Enum, Gauge, start_http_server
 
 # Directory to monitor for input files
 INPUT_DIR = os.environ.get("INPUT_DIR", "in_test")
@@ -15,6 +16,8 @@ INPUT_DIR = os.environ.get("INPUT_DIR", "in_test")
 JELLYFIN_URL = os.environ.get("JELLYFIN_URL", "http://jellyfin:8096")
 # Jellyfin API key
 JELLYFIN_API = os.environ.get("JELLYFIN_API", "")
+# Prometheus metrics port
+METRICS_PORT = int(os.environ.get("METRICS_PORT", "9100"))
 
 ENDING = " - Transcoded"
 ENDING_ORG = " - Original"
@@ -22,13 +25,35 @@ TARGET_FROMAT = "mp4"
 ALLOWED_EXTENSIONS = ["mp4", "mkv"]
 DISALLOWED_ENDINGS = [ENDING]
 
+# Prometheus metrics
+total_files = Gauge("transcode_total_files", "Total number of files that exist")
+total_files_to_process = Gauge(
+    "transcode_total_files_to_process",
+    "Total number of files that still need to be processed",
+)
+total_files_transcoded = Gauge(
+    "transcode_total_files_transcoded", "Total number of files transcoded"
+)
+current_state = Enum(
+    "transcode_current_state",
+    "Current state of the transcoder",
+    states=["idle", "processing"],
+)
+
 
 def main():
+    # Start Prometheus metrics server
+    _ = start_http_server(METRICS_PORT)
+    print(f"Prometheus metrics server started on port {METRICS_PORT}")
+
     try:
         _ = subprocess.run(["ffmpeg", "-version"], capture_output=False, text=True)
     except FileNotFoundError:
         print("FFmpeg not found!")
         sys.exit(1)
+
+    # Setup metrics
+    current_state.state("idle")
 
     # Clean up any bad transcodes on startup
     try:
@@ -53,7 +78,13 @@ def main():
 # Main loop
 def process_new() -> bool:
     # Get all files that need to be processed
-    to_process = remove_files_if_procesed(get_all_files())
+    all = get_all_files()
+    to_process = remove_files_if_procesed(all)
+
+    # Update metrics
+    total_files.set(len(all))
+    total_files_to_process.set(len(to_process))
+    total_files_transcoded.set(len(all) - len(to_process))
 
     if len(to_process) >= 1:
         print(f"Found {len(to_process)} files to process.")
@@ -159,6 +190,7 @@ def get_stream_info(file_path: str) -> list[str]:
 
 # Process a single file
 def process_file(file_path: Path):
+    current_state.state("processing")
     try:
         dir_name = file_path.parent
         name = file_path.stem
@@ -173,6 +205,10 @@ def process_file(file_path: Path):
     except BaseException as e:
         print(f"Error processing file {file_path}:\n\t {e}")
         delete_transcode(file_path)
+    finally:
+        total_files_to_process.dec()
+        total_files_transcoded.inc()
+        current_state.state("idle")
 
 
 # Scan "INPUT_DIR" for all files
