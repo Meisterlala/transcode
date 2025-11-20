@@ -178,7 +178,7 @@ def get_stream_info(file_path: str) -> list[str]:
         "-select_streams",
         "s",
         "-show_entries",
-        "stream=index",
+        "stream=index:stream_tags=language",
         "-of",
         "default=noprint_wrappers=1:nokey=1",
         file_path,
@@ -187,9 +187,26 @@ def get_stream_info(file_path: str) -> list[str]:
     result = subprocess.run(command, capture_output=True, text=True, check=True)
     if result.returncode != 0:
         raise Exception(f"FFprobe error: {result.stderr}")
-    out = result.stdout.strip()
-    # Convert to arryy of stream indexes
-    return out.split("\n") if out else []
+    print(result.stdout)
+    out = result.stdout.strip().split("\n")
+
+    # If odd number of lines, something went wrong
+    if len(out) % 2 != 0:
+        return out if out else []
+
+    # Sort by language tag (prefer eng)
+    # Combine index and language
+    combined: list[tuple[str, str]] = []
+    for i in range(0, len(out), 2):
+        index = out[i]
+        language = out[i + 1]
+        combined.append((index, language))
+
+    # Sort so that "eng" comes first
+    combined.sort(key=lambda x: 0 if x[1] == "eng" else 1 if x[1] == "und" else 2)
+    out = [index for index, _ in combined]
+
+    return out if out else []
 
 
 # Process a single file
