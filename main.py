@@ -152,8 +152,8 @@ def run_ffmpeg(input_path: str, output_path: str, subtitle_limit: int = 0):
         # "veryfast",  # speed vs quality
         "-preset",
         "10",  # speed vs quality (0=best quality, 13=fastest but really bad)
-        # "-t",
-        # "30",
+        "-t",
+        "120",
         "-c:a",
         "libvorbis",  # Audio Encoder
         "-c:s",
@@ -218,7 +218,7 @@ def process_file(file_path: Path):
     current_state.state("processing")
     try:
         dir_name = file_path.parent
-        name = file_path.stem
+        name = file_path.stem.removesuffix(ENDING_ORG)
         output_name = f"{name}{ENDING}.{TARGET_FROMAT}"
         output_path = dir_name / output_name
         print("===================== Processing started ======================")
@@ -248,12 +248,25 @@ def get_all_files() -> list[Path]:
     return input_files
 
 
+def get_all_transcoded_files(all_files: list[Path]) -> list[Path]:
+    transcoded_files: list[Path] = []
+    for file_path in all_files:
+        dir_name = file_path.parent
+        name = file_path.stem.removesuffix(ENDING_ORG)
+        for ext in set([TARGET_FROMAT, *ALLOWED_EXTENSIONS]):
+            processed_name = f"{name}{ENDING}.{ext}"
+            processed_path = dir_name / processed_name
+            if processed_path.exists():
+                transcoded_files.append(processed_path)
+    return transcoded_files
+
+
 # Remove files that have already been processed
 def remove_files_if_procesed(file_list: list[Path]) -> list[Path]:
     unprocessed_files: list[Path] = []
     for file_path in file_list:
         dir_name = file_path.parent
-        name = file_path.stem
+        name = file_path.stem.removesuffix(ENDING_ORG)
         processed_name = f"{name}{ENDING}.{TARGET_FROMAT}"
         processed_path = dir_name / processed_name
         if not processed_path.exists():
@@ -307,7 +320,7 @@ def update_all_libraries(jellyfin_url: str, api_key: str):
 
 def delete_transcode(file: Path):
     dir_name = file.parent
-    name = file.stem
+    name = file.stem.removesuffix(ENDING_ORG)
     processed_name = f"{name}{ENDING}.{TARGET_FROMAT}"
     processed_path = dir_name / processed_name
     if processed_path.exists():
@@ -319,7 +332,7 @@ def cleanup_bad_transcodes():
     all_files = get_all_files()
     for file_path in all_files:
         dir_name = file_path.parent
-        name = file_path.stem
+        name = file_path.stem.removesuffix(ENDING_ORG)
         processed_name = f"{name}{ENDING}.{TARGET_FROMAT}"
         processed_path = dir_name / processed_name
         if processed_path.exists() and processed_path.stat().st_size < 100:
@@ -333,13 +346,18 @@ if __name__ == "__main__":
     print("Run `main.py delete` to delete all transcoded files.")
 
     if len(sys.argv) > 1 and sys.argv[1] == "delete":
-        print("Deleting all transcoded files...")
+        print("Finding all transcoded files for delition ...")
+        all_files = get_all_files()
+        print(f"Found {len(all_files)} total files.")
+        transcoded = get_all_transcoded_files(all_files)
+        print(f"Found {len(transcoded)} transcoded files to delete.")
+        for file_path in transcoded:
+            print(f" - {file_path.name}")
         print("Press y to continue...")
         confirmation = input().strip().lower()
         if confirmation != "y":
             print("Aborting deletion.")
             sys.exit(0)
-        all_files = get_all_files()
         for file_path in all_files:
             delete_transcode(file_path)
         print("Deletion complete.")
