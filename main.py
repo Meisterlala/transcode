@@ -152,8 +152,6 @@ def run_ffmpeg(input_path: str, output_path: str, subtitle_limit: int = 0):
         # "veryfast",  # speed vs quality
         "-preset",
         "10",  # speed vs quality (0=best quality, 13=fastest but really bad)
-        "-t",
-        "120",
         "-c:a",
         "libvorbis",  # Audio Encoder
         "-c:s",
