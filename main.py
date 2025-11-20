@@ -96,7 +96,7 @@ def process_new() -> bool:
 
 
 # Execute ffmpeg
-def run_ffmpeg(input_path: str, output_path: str, subtitle_limit: int = 0):
+def run_ffmpeg(input_path: str, output_path: str, subtitle_limit: int = 1):
     if subtitle_limit > 0:
         # Get subtitle stream count
         streams = get_stream_info(input_path)
@@ -145,21 +145,19 @@ def run_ffmpeg(input_path: str, output_path: str, subtitle_limit: int = 0):
         "-map",
         "0:a",  # all audio streams
         "-c:v",
-        "libsvtav1",  # Video Encoder
+        "libx264",  # Video Encoder
         "-crf",
-        "23",  # (lower = better quality)
-        # "-preset",
-        # "veryfast",  # speed vs quality
+        "25",  # (lower = better quality)
         "-preset",
-        "10",  # speed vs quality (0=best quality, 13=fastest but really bad)
+        "superfast",  # speed vs quality
+        # "-preset",
+        # "10",  # speed vs quality (0=best quality, 13=fastest but really bad)
         "-c:a",
         "libvorbis",  # Audio Encoder
-        "-c:s",
-        "dvdsub",  # Copy subtitle streams
-        "-movflags",
-        "+faststart",  # for MP4 streaming,
-        # "-tune",
-        # tune,
+        # "-movflags",
+        # "+faststart",  # for MP4 streaming,
+        "-tune",
+        tune,
         output_path,
     ]
     print(" ".join(command))
