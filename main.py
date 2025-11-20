@@ -360,4 +360,13 @@ if __name__ == "__main__":
             delete_transcode(file_path)
         print("Deletion complete.")
         sys.exit(0)
+    if len(sys.argv) > 1 and sys.argv[1] == "list":
+        print("Finding all transcoded files ...")
+        all_files = get_all_files()
+        print(f"Found {len(all_files)} total files.")
+        transcoded = get_all_transcoded_files(all_files)
+        print(f"Found {len(transcoded)} transcoded files:")
+        for file_path in transcoded:
+            print(f" - {file_path.name}")
+        sys.exit(0)
     main()
