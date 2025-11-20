@@ -96,7 +96,7 @@ def process_new() -> bool:
 
 
 # Execute ffmpeg
-def run_ffmpeg(input_path: str, output_path: str, subtitle_limit: int = 1):
+def run_ffmpeg(input_path: str, output_path: str, subtitle_limit: int = 0):
     if subtitle_limit > 0:
         # Get subtitle stream count
         streams = get_stream_info(input_path)
@@ -113,7 +113,7 @@ def run_ffmpeg(input_path: str, output_path: str, subtitle_limit: int = 1):
             maps.extend(["-map", "0:v"])
     else:
         filters = []
-        maps = ["-map", "0:v"]  # all video and subtitles if exist
+        maps = ["-map", "0:v", "-map", "0:s?"]  # all video and subtitles if exist
 
     # Combine filters
     filter_complex: list[str] = (
@@ -121,10 +121,10 @@ def run_ffmpeg(input_path: str, output_path: str, subtitle_limit: int = 1):
     )
 
     # if file path contains "anime", tune for anime
-    # if "anime" in input_path.lower():
-    #     tune = "animation"
-    # else:
-    #     tune = "film"
+    if "anime" in input_path.lower():
+        tune = "animation"
+    else:
+        tune = "film"
 
     command = [
         "ffmpeg",
@@ -145,15 +145,19 @@ def run_ffmpeg(input_path: str, output_path: str, subtitle_limit: int = 1):
         "-map",
         "0:a",  # all audio streams
         "-c:v",
-        "libsvtav1",  # Use H.264 codec
+        "libsvtav1",  # Video Encoder
         "-crf",
         "23",  # (lower = better quality)
+        # "-preset",
+        # "veryfast",  # speed vs quality
         "-preset",
         "10",  # speed vs quality (0=best quality, 13=fastest but really bad)
         # "-t",
-        # "20",
+        # "30",
         "-c:a",
         "libvorbis",  # Audio Encoder
+        "-c:s",
+        "dvdsub",  # Copy subtitle streams
         "-movflags",
         "+faststart",  # for MP4 streaming,
         # "-tune",
