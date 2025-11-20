@@ -149,7 +149,7 @@ def run_ffmpeg(input_path: str, output_path: str, subtitle_limit: int = 1):
         "-crf",
         "23",  # (lower = better quality)
         "-preset",
-        "8",  # speed vs quality (0=best quality, 13=fastest but really bad)
+        "10",  # speed vs quality (0=best quality, 13=fastest but really bad)
         # "-t",
         # "20",
         "-c:a",
