@@ -71,8 +71,8 @@ def main():
                 except Exception as e:
                     print("Failed to update Jellyfin libraries.", e)
             time.sleep(1)  # Short sleep if a file was processed
-
-        time.sleep(60)  # Sleep before checking for new files
+        else:
+            time.sleep(60)  # Sleep before checking for new files
 
 
 # Main loop
