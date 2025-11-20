@@ -21,7 +21,7 @@ METRICS_PORT = int(os.environ.get("METRICS_PORT", "9100"))
 
 ENDING = " - Transcoded"
 ENDING_ORG = " - Original"
-TARGET_FROMAT = "mp4"
+TARGET_FROMAT = "mkv"
 ALLOWED_EXTENSIONS = ["mp4", "mkv"]
 DISALLOWED_ENDINGS = [ENDING]
 
@@ -96,27 +96,35 @@ def process_new() -> bool:
 
 
 # Execute ffmpeg
-def run_ffmpeg(input_path: str, output_path: str):
-    # Get subtitle stream count
-    streams = get_stream_info(input_path)
-    streams = streams[:3]  # Limit to max 3 subtitle streams
-    print("Subtitle streams found:", streams)
+def run_ffmpeg(input_path: str, output_path: str, subtitle_limit: int = 1):
+    if subtitle_limit > 0:
+        # Get subtitle stream count
+        streams = get_stream_info(input_path)
+        streams = streams[:subtitle_limit]  # Limit number of subtitles
+        print("Subtitle streams found:", streams)
+        # Build overlay filter
+        filters: list[str] = []
+        maps: list[str] = []
+        for streams_index in streams:
+            filters.append(f"[0:v][0:{streams_index}]overlay[v{streams_index}]")
+            maps.extend(["-map", f"[v{streams_index}]"])
+        # Fallback if no subtitles
+        if not streams:
+            maps.extend(["-map", "0:v"])
+    else:
+        filters = []
+        maps = ["-map", "0:v"]  # all video and subtitles if exist
 
-    # Build overlay filter
-    filters: list[str] = []
-    maps: list[str] = []
-    for streams_index in streams:
-        filters.append(f"[0:v][0:{streams_index}]overlay[v{streams_index}]")
-        maps.extend(["-map", f"[v{streams_index}]"])
-    # Fallback if no subtitles
-    if not streams:
-        maps.extend(["-map", "0:v"])
+    # Combine filters
+    filter_complex: list[str] = (
+        ["-filter_complex", ";".join(filters)] if filters else []
+    )
 
     # if file path contains "anime", tune for anime
-    if "anime" in input_path.lower():
-        tune = "animation"
-    else:
-        tune = "film"
+    # if "anime" in input_path.lower():
+    #     tune = "animation"
+    # else:
+    #     tune = "film"
 
     command = [
         "ffmpeg",
@@ -132,28 +140,24 @@ def run_ffmpeg(input_path: str, output_path: str):
         "50M",
         "-i",
         input_path,
-        # Generate a complex filter
-        "-filter_complex",
-        ";".join(filters),
-        *maps,
+        *filter_complex,  # Add filters
+        *maps,  # video map
         "-map",
         "0:a",  # all audio streams
-        # "-map",
-        # "0:s?",  # subtitles, optional if they exist
         "-c:v",
-        "libx264",  # Use H.264 codec
-        # "-preset", # preset can be adjusted for speed vs quality
-        # "slow",
+        "libsvtav1",  # Use H.264 codec
         "-crf",
         "23",  # (lower = better quality)
+        "-preset",
+        "8",  # speed vs quality (0=best quality, 13=fastest but really bad)
         # "-t",
         # "20",
         "-c:a",
-        "aac",  # Use AAC codec for audio
+        "libvorbis",  # Audio Encoder
         "-movflags",
         "+faststart",  # for MP4 streaming,
-        "-tune",
-        tune,
+        # "-tune",
+        # tune,
         output_path,
     ]
     print(" ".join(command))
