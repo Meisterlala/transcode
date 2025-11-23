@@ -8,7 +8,7 @@ import time
 from pathlib import Path
 
 import requests
-from prometheus_client import Enum, Gauge, start_http_server
+from prometheus_client import Enum, Gauge, Info, start_http_server
 
 # Directory to monitor for input files
 INPUT_DIR = os.environ.get("INPUT_DIR", "in_test")
@@ -39,6 +39,7 @@ current_state = Enum(
     "Current state of the transcoder",
     states=["idle", "processing"],
 )
+current_file = Info("transcode_current_file", "File currently being processed")
 
 
 def main():
@@ -96,7 +97,7 @@ def process_new() -> bool:
 
 
 # Execute ffmpeg
-def run_ffmpeg(input_path: str, output_path: str, subtitle_limit: int = 1):
+def run_ffmpeg(input_path: str, output_path: str, subtitle_limit: int = 2):
     if subtitle_limit > 0:
         # Get subtitle stream count
         streams = get_stream_info(input_path)
@@ -212,6 +213,7 @@ def get_stream_info(file_path: str) -> list[str]:
 # Process a single file
 def process_file(file_path: Path):
     current_state.state("processing")
+    current_file.info({"file": str(file_path)})
     try:
         dir_name = file_path.parent
         name = file_path.stem.removesuffix(ENDING_ORG)
@@ -230,6 +232,7 @@ def process_file(file_path: Path):
         total_files_to_process.dec()
         total_files_transcoded.inc()
         current_state.state("idle")
+        current_file.info({"file": ""})
 
 
 # Scan "INPUT_DIR" for all files
@@ -284,7 +287,7 @@ def update_all_libraries(jellyfin_url: str, api_key: str):
     try:
         resp = requests.get(f"{jellyfin_url}/Library/VirtualFolders", headers=headers)
         resp.raise_for_status()
-        libraries = resp.json()
+        libraries = resp.json()  # pyright: ignore[reportAny]
     except Exception as e:
         print(f"Failed to fetch libraries: {e}")
         return
@@ -294,9 +297,9 @@ def update_all_libraries(jellyfin_url: str, api_key: str):
         return
 
     # Trigger a scan for each library
-    for lib in libraries:
-        lib_id = lib.get("ItemId")
-        lib_name = lib.get("Name", "Unknown")
+    for lib in libraries:  # pyright: ignore[reportAny]
+        lib_id = lib.get("ItemId")  # pyright: ignore[reportAny]
+        lib_name = lib.get("Name", "Unknown")  # pyright: ignore[reportAny]
         if not lib_id:
             print(f"Skipping library {lib_name} (no ID)")
             continue
@@ -308,7 +311,7 @@ def update_all_libraries(jellyfin_url: str, api_key: str):
                 "?Recursive=true&ImageRefreshMode=Default&MetadataRefreshMode=Default"
                 "&ReplaceAllImages=false&RegenerateTrickplay=false&ReplaceAllMetadata=false"
             )
-            requests.post(scan_url, headers=headers)
+            _ = requests.post(scan_url, headers=headers)
             print(f"Scan triggered for '{lib_name}'.")
         except Exception as e:
             print(f"Failed to scan library {lib_name}: {e}")
@@ -337,10 +340,7 @@ def cleanup_bad_transcodes():
 
 
 if __name__ == "__main__":
-    print("Starting transcoder...")
-    print("Input Directory:", INPUT_DIR)
-    print("Run `main.py delete` to delete all transcoded files.")
-
+    # main.py delete
     if len(sys.argv) > 1 and sys.argv[1] == "delete":
         print("Finding all transcoded files for delition ...")
         all_files = get_all_files()
@@ -358,6 +358,7 @@ if __name__ == "__main__":
             delete_transcode(file_path)
         print("Deletion complete.")
         sys.exit(0)
+    # main.py list
     if len(sys.argv) > 1 and sys.argv[1] == "list":
         print("Finding all transcoded files ...")
         all_files = get_all_files()
@@ -367,4 +368,9 @@ if __name__ == "__main__":
         for file_path in transcoded:
             print(f" - {file_path.name}")
         sys.exit(0)
+
+    print("Starting transcoder...")
+    print("Input Directory:", INPUT_DIR)
+    print("Run `main.py delete` to delete all transcoded files.")
+    print("Run `main.py list` to list all transcoded files.")
     main()
