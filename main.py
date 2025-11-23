@@ -2,8 +2,10 @@
 
 import os
 import random
+import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -41,11 +43,36 @@ current_state = Enum(
 )
 current_file = Info("transcode_current_file", "File currently being processed")
 
+# Shutdown coordination
+shutdown_event = threading.Event()
+current_ffmpeg_process: subprocess.Popen | None = None  # pyright: ignore[reportMissingTypeArgument]
+
+
+def handle_shutdown(signum, frame) -> None:  # pyright: ignore[reportUnknownParameterType]
+    """Signal handler for graceful shutdown (SIGINT/SIGTERM)."""
+    print(f"Received signal {signum}, initiating graceful shutdown...")
+    shutdown_event.set()
+    # Attempt to terminate ffmpeg process if running
+    global current_ffmpeg_process
+    if current_ffmpeg_process and current_ffmpeg_process.poll() is None:
+        try:
+            print("Sending SIGTERM to ffmpeg process...")
+            current_ffmpeg_process.terminate()
+        except Exception as e:  # pragma: no cover - defensive
+            print("Failed to terminate ffmpeg process:", e)
+
+
+def install_signal_handlers():
+    _ = signal.signal(signal.SIGTERM, handle_shutdown)  # pyright: ignore[reportUnknownArgumentType]
+    _ = signal.signal(signal.SIGINT, handle_shutdown)  # pyright: ignore[reportUnknownArgumentType]
+
 
 def main():
     # Start Prometheus metrics server
     _ = start_http_server(METRICS_PORT)
     print(f"Prometheus metrics server started on port {METRICS_PORT}")
+
+    install_signal_handlers()
 
     try:
         _ = subprocess.run(["ffmpeg", "-version"], capture_output=False, text=True)
@@ -62,7 +89,7 @@ def main():
     except Exception:
         print("Failed to cleanup bad transcodes on startup.")
 
-    while True:
+    while not shutdown_event.is_set():
         if process_new():
             # Update Jellyfin
             if JELLYFIN_API != "":
@@ -71,9 +98,38 @@ def main():
                     update_all_libraries(JELLYFIN_URL, JELLYFIN_API)
                 except Exception as e:
                     print("Failed to update Jellyfin libraries.", e)
-            time.sleep(1)  # Short sleep if a file was processed
+            # Short sleep if a file was processed
+            for _ in range(10):  # interruptible sleep (10 * 0.1 = 1s)
+                if shutdown_event.is_set():
+                    break
+                time.sleep(0.1)
         else:
-            time.sleep(60)  # Sleep before checking for new files
+            # Interruptible longer sleep (60s)
+            print("No files to process. Sleeping for 60 seconds...")
+            for _ in range(600):  # 600 * 0.1 = 60s
+                if shutdown_event.is_set():
+                    break
+                time.sleep(0.1)
+
+    # Final cleanup before exit
+    print("Shutdown requested. Cleaning up...")
+    current_state.state("idle")
+    current_file.info({"file": ""})
+
+    # Ensure ffmpeg process is terminated if still running
+    global current_ffmpeg_process
+    if current_ffmpeg_process and current_ffmpeg_process.poll() is None:
+        try:
+            print("Terminating ffmpeg process during shutdown...")
+            current_ffmpeg_process.terminate()
+            current_ffmpeg_process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            print("FFmpeg did not exit after SIGTERM, killing...")
+            current_ffmpeg_process.kill()
+        except Exception as e:  # pragma: no cover - defensive
+            print("Error terminating ffmpeg during shutdown:", e)
+
+    print("Graceful shutdown complete.")
 
 
 # Main loop
@@ -87,7 +143,7 @@ def process_new() -> bool:
     total_files_to_process.set(len(to_process))
     total_files_transcoded.set(len(all) - len(to_process))
 
-    if len(to_process) >= 1:
+    if len(to_process) >= 1 and not shutdown_event.is_set():
         print(f"Found {len(to_process)} files to process.")
         random_file = random.Random().choice(to_process)
         print(f"Picking random file: {random_file}")
@@ -97,7 +153,12 @@ def process_new() -> bool:
 
 
 # Execute ffmpeg
-def run_ffmpeg(input_path: str, output_path: str, subtitle_limit: int = 2):
+def run_ffmpeg(
+    input_path: str,
+    output_path: str,
+    subtitle_limit: int = 2,
+    termination_timeout: int = 15,
+):
     if subtitle_limit > 0:
         # Get subtitle stream count
         streams = get_stream_info(input_path)
@@ -122,23 +183,20 @@ def run_ffmpeg(input_path: str, output_path: str, subtitle_limit: int = 2):
     )
 
     # if file path contains "anime", tune for anime
-    if "anime" in input_path.lower():
-        tune = "animation"
-    else:
-        tune = "film"
+    tune = "animation" if "anime" in input_path.lower() else "film"
 
     command = [
         "ffmpeg",
         "-hide_banner",  # suppress banner
         "-stats_period",
-        "3",  # Only show stats every second
+        "3",  # Only show stats periodically
         "-progress",
         "pipe:1",  # progress to stdout
         "-nostats",  # suppress periodic stats, we use the progress for that
-        "-analyzeduration",  # increase analyze duration
-        "50G",
-        "-probesize",  # increase probe size
-        "50M",
+        "-analyzeduration",
+        "50G",  # increase analyze duration
+        "-probesize",
+        "50M",  # increase probe size
         "-i",
         input_path,
         *filter_complex,  # Add filters
@@ -151,20 +209,61 @@ def run_ffmpeg(input_path: str, output_path: str, subtitle_limit: int = 2):
         "25",  # (lower = better quality)
         "-preset",
         "superfast",  # speed vs quality
-        # "-preset",
-        # "10",  # speed vs quality (0=best quality, 13=fastest but really bad)
         "-c:a",
         "libvorbis",  # Audio Encoder
-        # "-movflags",
-        # "+faststart",  # for MP4 streaming,
         "-tune",
         tune,
         output_path,
     ]
     print(" ".join(command))
-    result = subprocess.run(command, capture_output=False, text=True, check=True)
-    if result.returncode != 0:
-        raise Exception(f"FFmpeg error: {result.stderr}")
+
+    global current_ffmpeg_process
+    # Start ffmpeg in a new process group so we can terminate the whole group if needed
+    current_ffmpeg_process = subprocess.Popen(
+        command, text=True, start_new_session=True
+    )
+    try:
+        start_time = time.time()
+        # Poll loop so we can react to shutdown_event
+        while True:
+            if shutdown_event.is_set():
+                if current_ffmpeg_process.poll() is None:
+                    print(
+                        "Shutdown detected. Sending SIGTERM to ffmpeg process group..."
+                    )
+                    try:
+                        # Send SIGTERM to the process group for all ffmpeg children
+                        os.killpg(current_ffmpeg_process.pid, signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
+                    # Wait up to termination_timeout seconds
+                    waited = 0
+                    while waited < termination_timeout:
+                        if current_ffmpeg_process.poll() is not None:
+                            break
+                        time.sleep(1)
+                        waited += 1
+                    if current_ffmpeg_process.poll() is None:
+                        print(
+                            "FFmpeg did not exit after SIGTERM, sending SIGKILL to process group..."
+                        )
+                        try:
+                            os.killpg(current_ffmpeg_process.pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                    raise InterruptedError("Transcode interrupted by shutdown")
+                break
+
+            ret = current_ffmpeg_process.poll()
+            if ret is not None:
+                break
+            time.sleep(1)
+
+        ret_code = current_ffmpeg_process.returncode
+        if ret_code != 0:
+            raise Exception(f"FFmpeg exited with non-zero status {ret_code}")
+    finally:
+        current_ffmpeg_process = None
 
 
 def get_stream_info(file_path: str) -> list[str]:
@@ -196,7 +295,6 @@ def get_stream_info(file_path: str) -> list[str]:
         return out if out else []
 
     # Sort by language tag (prefer eng)
-    # Combine index and language
     combined: list[tuple[str, str]] = []
     for i in range(0, len(out), 2):
         index = out[i]
@@ -222,14 +320,20 @@ def process_file(file_path: Path):
         print("===================== Processing started ======================")
         run_ffmpeg(str(file_path), str(output_path))
         print("===================== Finished processing =====================")
+    except InterruptedError:
+        print("Processing interrupted. Cleaning partial transcode...")
+        delete_transcode(file_path)
     except KeyboardInterrupt:
+        print("KeyboardInterrupt detected. Cleaning partial transcode...")
         delete_transcode(file_path)
         sys.exit(1)
     except BaseException as e:
         print(f"Error processing file {file_path}:\n\t {e}")
         delete_transcode(file_path)
     finally:
-        total_files_to_process.dec()
+        # Adjust metrics only if we actually started a file (avoid negative values)
+        if total_files_to_process._value.get() > 0:  # type: ignore[attr-defined]
+            total_files_to_process.dec()
         total_files_transcoded.inc()
         current_state.state("idle")
         current_file.info({"file": ""})
@@ -275,12 +379,7 @@ def remove_files_if_procesed(file_list: list[Path]) -> list[Path]:
 
 # Update jellyfin registries
 def update_all_libraries(jellyfin_url: str, api_key: str):
-    """
-    Fetch all libraries from Jellyfin and trigger a scan for each.
-
-    :param jellyfin_url: Base URL of the Jellyfin server (e.g., http://server_ip)
-    :param api_key: Your Jellyfin API key
-    """
+    """Fetch all libraries from Jellyfin and trigger a scan for each."""
     headers = {"X-Emby-Token": api_key}
 
     # Fetch libraries
