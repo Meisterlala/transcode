@@ -213,7 +213,7 @@ def get_stream_info(file_path: str) -> list[str]:
 # Process a single file
 def process_file(file_path: Path):
     current_state.state("processing")
-    current_file.info({"file": str(file_path)})
+    current_file.info({"file": str(file_path.name)})
     try:
         dir_name = file_path.parent
         name = file_path.stem.removesuffix(ENDING_ORG)
