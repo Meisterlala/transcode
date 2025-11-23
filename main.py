@@ -45,7 +45,7 @@ current_file = Info("transcode_current_file", "File currently being processed")
 
 # Shutdown coordination
 shutdown_event = threading.Event()
-current_ffmpeg_process: subprocess.Popen | None = None  # pyright: ignore[reportMissingTypeArgument]
+current_ffmpeg_process = None
 
 
 def handle_shutdown(signum, frame) -> None:  # pyright: ignore[reportUnknownParameterType]
