@@ -10,7 +10,11 @@ import time
 from pathlib import Path
 
 import requests
+from dotenv import load_dotenv
 from prometheus_client import Enum, Gauge, Info, start_http_server
+
+# Load environment variables from .env file if present
+_ = load_dotenv()
 
 # Directory to monitor for input files
 INPUT_DIR = os.environ.get("INPUT_DIR", "in_test")
@@ -20,6 +24,8 @@ JELLYFIN_URL = os.environ.get("JELLYFIN_URL", "http://jellyfin:8096")
 JELLYFIN_API = os.environ.get("JELLYFIN_API", "")
 # Prometheus metrics port
 METRICS_PORT = int(os.environ.get("METRICS_PORT", "9100"))
+# Render device for VAAPI
+VAAPI_RENDER_DEVICE = os.environ.get("VAAPI_RENDER_DEVICE", "/dev/dri/renderD128")
 
 ENDING = " - Transcoded"
 ENDING_ORG = " - Original"
@@ -69,8 +75,11 @@ def install_signal_handlers():
 
 def main():
     # Start Prometheus metrics server
-    _ = start_http_server(METRICS_PORT)
-    print(f"Prometheus metrics server started on port {METRICS_PORT}")
+    if METRICS_PORT > 0:
+        _ = start_http_server(METRICS_PORT)
+        print(f"Prometheus metrics server started on port {METRICS_PORT}")
+    else:
+        print("Prometheus metrics server disabled (METRICS_PORT <= 0)")
 
     install_signal_handlers()
 
@@ -156,31 +165,45 @@ def process_new() -> bool:
 def run_ffmpeg(
     input_path: str,
     output_path: str,
-    subtitle_limit: int = 2,
+    subtitle_limit: int = 0,
     termination_timeout: int = 15,
 ):
+    filters: list[str] = []
+    maps: list[str] = []
+
     if subtitle_limit > 0:
-        # Get subtitle stream count
         streams = get_stream_info(input_path)
         streams = streams[:subtitle_limit]  # Limit number of subtitles
         print("Subtitle streams found:", streams)
-        # Build overlay filter
-        filters: list[str] = []
-        maps: list[str] = []
-        for streams_index in streams:
-            filters.append(f"[0:v][0:{streams_index}]overlay[v{streams_index}]")
-            maps.extend(["-map", f"[v{streams_index}]"])
-        # Fallback if no subtitles
-        if not streams:
-            maps.extend(["-map", "0:v"])
+        # 1. SPLIT (Hardware)
+        # outputs = "".join([f"[base_hw{i}]" for i in range(len(streams))])
+        # filters.append(f"[0:v]split={len(streams)}{outputs}")
+
+        # 2. MAP, OVERLAY & UPLOAD
+        for i, sub_index in enumerate(streams):
+            # The Pipeline:
+            # scale_vaapi=format=nv12  -> VITAL: GPU converts 10-bit to 8-bit here.
+            #                             Prevents 'Failed to map frame: -22' error.
+            # hwmap=...                -> Zero-copy map to CPU.
+            # overlay                  -> Burn subtitle (Creates NEW frame, breaking the map).
+            # hwupload                 -> Upload new frame to GPU.
+
+            chain = (
+                f"[base_hw{i}]hwdownload,format=nv12[base_soft{i}];"
+                f"[base_soft{i}][0:{sub_index}]overlay[burned_{i}];"
+                f"[burned_{i}]format=nv12,hwupload[v_out{i}]"
+            )
+            filters.append(chain)
+            maps.extend(["-map", f"[v_out{i}]"])
     else:
-        filters = []
-        maps = ["-map", "0:v", "-map", "0:s?"]  # all video and subtitles if exist
+        # No subtitles? Just pass the hardware stream through
+        maps.extend(["-map", "0:v"])
 
     # Combine filters
     filter_complex: list[str] = (
         ["-filter_complex", ";".join(filters)] if filters else []
     )
+    print("Filter complex:", filter_complex)
 
     # if file path contains "anime", tune for anime
     tune = "animation" if "anime" in input_path.lower() else "film"
@@ -197,22 +220,34 @@ def run_ffmpeg(
         "50G",  # increase analyze duration
         "-probesize",
         "50M",  # increase probe size
+        "-init_hw_device",
+        "vaapi=va:/dev/dri/renderD129",  # Initialize VAAPI device
+        "-hwaccel",
+        "vaapi",  # Use VAAPI hardware acceleration
+        "-hwaccel_device",
+        "va",
+        "-hwaccel_output_format",
+        "vaapi",  # Use VAAPI for hwaccel output
         "-i",
         input_path,
+        "-filter_hw_device",
+        "va",  # Use VAAPI device for filters
         *filter_complex,  # Add filters
         *maps,  # video map
         "-map",
         "0:a",  # all audio streams
         "-c:v",
-        "libx264",  # Video Encoder
-        "-crf",
-        "25",  # (lower = better quality)
-        "-preset",
-        "superfast",  # speed vs quality
-        "-c:a",
-        "libvorbis",  # Audio Encoder
-        "-tune",
-        tune,
+        "hevc_vaapi",  # Video Encoder
+        # "-global_quality",
+        # "50",
+        # "-rc_mode",
+        # "ICQ",  #
+        # "-preset",
+        # "superfast",  # speed vs quality
+        # "-c:a",
+        # "libvorbis",  # Audio Encoder
+        # "-tune",
+        # tune,
         output_path,
     ]
     print(" ".join(command))
@@ -220,7 +255,10 @@ def run_ffmpeg(
     global current_ffmpeg_process
     # Start ffmpeg in a new process group so we can terminate the whole group if needed
     current_ffmpeg_process = subprocess.Popen(
-        command, text=True, start_new_session=True
+        command,
+        text=True,
+        start_new_session=True,
+        env={**os.environ, "LIBVA_DRIVER_NAME": "radeonsi"},
     )
     try:
         start_time = time.time()
