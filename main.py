@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import json
 import os
 import random
 import signal
@@ -351,6 +352,8 @@ def get_stream_info(file_path: str) -> list[str]:
         "ffprobe",
         "-v",
         "error",
+        "-print_format",
+        "json",
         "-analyzeduration",
         "50G",
         "-probesize",
@@ -359,40 +362,46 @@ def get_stream_info(file_path: str) -> list[str]:
         "s",
         "-show_entries",
         "stream=index:stream_tags=language,title",
-        "-of",
-        "default=noprint_wrappers=1:nokey=1",
         file_path,
     ]
     print(" ".join(command))
     result = subprocess.run(command, capture_output=True, text=True, check=True)
     if result.returncode != 0:
         raise Exception(f"FFprobe error: {result.stderr}")
-    print(result.stdout)
     out = result.stdout.strip().split("\n")
 
     # Ignore empty result
-    if len(out) < 3:
+    if len(out) < 1:
         return []
 
-    # Build tuples of (index, language, title)
-    combined: list[tuple[str, str, str]] = []
-    for i in range(0, len(out), 3):
-        index = out[i]
-        language = out[i + 1]
-        title = out[i + 2]
-        combined.append((index, language, title))
+    data = json.loads("\n".join(out))
+    # Pretty print
+    print("FFprobe stream info:")
+    print(json.dumps(data, indent=4))
 
-    # Remove sing/song stuff
-    combined = [
-        t for t in combined if not any(rem in t[2].lower() for rem in REMOVE_SUBTITLES)
+    streams = data.get("streams", [])
+    # keep only streams that don't contain unwanted tags
+    streams = [
+        s
+        for s in streams
+        if not any(
+            rem.lower() in s.get("tags", {}).get("title", "").lower()
+            for rem in REMOVE_SUBTITLES
+        )
     ]
 
-    # Sort so that "eng" comes first
-    combined.sort(key=lambda x: 0 if x[1] == "eng" else 1 if x[1] == "und" else 2)
+    # sort directly on the JSON objects by language
+    streams.sort(
+        key=lambda s: (
+            0
+            if s.get("tags", {}).get("language") == "eng"
+            else 1
+            if s.get("tags", {}).get("language") == "und"
+            else 2
+        )
+    )
 
-    out = [index for index, _, _ in combined]
-
-    return out if out else []
+    return [s.get("index") for s in streams]
 
 
 # Process a single file
