@@ -30,9 +30,7 @@ JELLYFIN_API = os.environ.get("JELLYFIN_API", "")
 METRICS_PORT = int(os.environ.get("METRICS_PORT", "9100"))
 # Render device for VAAPI
 VAAPI_RENDER_DEVICE = os.environ.get("VAAPI_RENDER_DEVICE", "/dev/dri/renderD128")
-SKIP_DB_PATH = Path(
-    os.environ.get("TRANSCODE_SKIP_DB", "/db/skip_tracker.sqlite3")
-).expanduser()
+DB_PATH = Path(os.environ.get("DB_PATH", "tracker.sqlite3")).expanduser()
 TEXT_BASED_SUBTITLE_CODECS = {
     "subrip",
     "srt",
@@ -90,10 +88,10 @@ def init_skip_db() -> None:
     with _DB_INIT_LOCK:
         if _DB_INITIALIZED:
             return
-        db_parent = SKIP_DB_PATH.parent
+        db_parent = DB_PATH.parent
         if not db_parent.exists():
             db_parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(str(SKIP_DB_PATH), timeout=30)
+        conn = sqlite3.connect(str(DB_PATH), timeout=30)
         try:
             conn.execute("PRAGMA journal_mode=WAL;")
             conn.execute(
@@ -113,10 +111,12 @@ def init_skip_db() -> None:
 
 def get_db_connection() -> sqlite3.Connection:
     init_skip_db()
-    return sqlite3.connect(str(SKIP_DB_PATH), timeout=30)
+    return sqlite3.connect(str(DB_PATH), timeout=30)
 
 
-def record_file_decision(file_path: Path, reason: str, metadata: dict[str, Any]) -> None:
+def record_file_decision(
+    file_path: Path, reason: str, metadata: dict[str, Any]
+) -> None:
     payload = json.dumps(metadata, separators=(",", ":"), sort_keys=True)
     with get_db_connection() as conn:
         conn.execute(
@@ -160,7 +160,9 @@ def clear_skip_records() -> None:
         conn.execute("DELETE FROM skipped_transcodes")
 
 
-def probe_subtitle_streams(file_path: str, verbose: bool = False) -> list[dict[str, Any]]:
+def probe_subtitle_streams(
+    file_path: str, verbose: bool = False
+) -> list[dict[str, Any]]:
     command = [
         "ffprobe",
         "-v",
@@ -743,7 +745,7 @@ if __name__ == "__main__":
         sys.exit(0)
     if len(sys.argv) > 1 and sys.argv[1] == "clear-db":
         print("This will remove all skip-tracking records.")
-        print(f"Database path: {SKIP_DB_PATH}")
+        print(f"Database path: {DB_PATH}")
         print("Press y to continue...")
         confirmation = input().strip().lower()
         if confirmation != "y":
