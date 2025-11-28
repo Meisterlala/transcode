@@ -415,7 +415,7 @@ def run_ffmpeg_vaapi(
         speed_preset = 0
 
         level = vbaq + speed_preset
-        level = (level << 1) | 1  # Set validity bit
+        # level = (level << 1) | 1  # Set validity bit
         return level
 
     command = [

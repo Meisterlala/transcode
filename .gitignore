@@ -1,5 +1,7 @@
-in_test/
 .venv/
 .env
 
 __pycache__/
+
+in_test/
+*.sqlite3
