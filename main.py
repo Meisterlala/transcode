@@ -160,7 +160,7 @@ def clear_skip_records() -> None:
         conn.execute("DELETE FROM skipped_transcodes")
 
 
-def probe_subtitle_streams(file_path: str) -> list[dict[str, Any]]:
+def probe_subtitle_streams(file_path: str, verbose: bool = False) -> list[dict[str, Any]]:
     command = [
         "ffprobe",
         "-v",
@@ -177,14 +177,18 @@ def probe_subtitle_streams(file_path: str) -> list[dict[str, Any]]:
         "stream=index,codec_name,codec_type:stream_tags=language,title",
         file_path,
     ]
-    print(" ".join(command))
+    if verbose:
+        print(" ".join(command))
+    else:
+        print(f"ffprobe subtitles (quiet): {file_path}")
     result = subprocess.run(command, capture_output=True, text=True, check=True)
     out = result.stdout.strip()
     if not out:
         return []
     data = json.loads(out)
-    print("FFprobe stream info:")
-    print(json.dumps(data, indent=4))
+    if verbose:
+        print("FFprobe stream info:")
+        print(json.dumps(data, indent=4))
     return data.get("streams", [])
 
 
@@ -542,7 +546,7 @@ def ffmpeg_filtergraph(command: list[str]):
 
 def get_stream_info(file_path: str) -> list[str]:
     try:
-        streams = probe_subtitle_streams(file_path)
+        streams = probe_subtitle_streams(file_path, verbose=True)
     except subprocess.CalledProcessError as exc:  # pragma: no cover - ffprobe failure
         raise Exception(f"FFprobe error: {exc.stderr}") from exc
 
