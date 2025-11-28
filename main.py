@@ -4,12 +4,14 @@ import json
 import os
 import random
 import signal
+import sqlite3
 import subprocess
 import sys
 import threading
 import time
 import traceback
 from pathlib import Path
+from typing import Any
 
 import requests
 from dotenv import load_dotenv
@@ -28,6 +30,18 @@ JELLYFIN_API = os.environ.get("JELLYFIN_API", "")
 METRICS_PORT = int(os.environ.get("METRICS_PORT", "9100"))
 # Render device for VAAPI
 VAAPI_RENDER_DEVICE = os.environ.get("VAAPI_RENDER_DEVICE", "/dev/dri/renderD128")
+SKIP_DB_PATH = Path(
+    os.environ.get("TRANSCODE_SKIP_DB", "/db/skip_tracker.sqlite3")
+).expanduser()
+TEXT_BASED_SUBTITLE_CODECS = {
+    "subrip",
+    "srt",
+    "webvtt",
+    "ass",
+    "ssa",
+    "text",
+}
+SKIP_REASON_TEXT = "text_subtitles_present"
 
 ENDING = " - Transcoded"
 ENDING_ORG = " - Original"
@@ -49,6 +63,10 @@ total_files_to_process = Gauge(
 total_files_transcoded = Gauge(
     "transcode_total_files_transcoded", "Total number of files transcoded"
 )
+total_files_skipped = Gauge(
+    "transcode_total_files_skipped",
+    "Total number of files skipped because subtitles are browser-readable",
+)
 current_state = Enum(
     "transcode_current_state",
     "Current state of the transcoder",
@@ -59,6 +77,171 @@ current_file = Info("transcode_current_file", "File currently being processed")
 # Shutdown coordination
 shutdown_event = threading.Event()
 current_ffmpeg_process = None
+_DB_INIT_LOCK = threading.Lock()
+_DB_INITIALIZED = False
+
+
+def init_skip_db() -> None:
+    """Initialize (if needed) the SQLite DB that tracks skipped files."""
+    global _DB_INITIALIZED
+    if _DB_INITIALIZED:
+        return
+    with _DB_INIT_LOCK:
+        if _DB_INITIALIZED:
+            return
+        db_parent = SKIP_DB_PATH.parent
+        if not db_parent.exists():
+            db_parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(str(SKIP_DB_PATH), timeout=30)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS skipped_transcodes (
+                    file_path TEXT PRIMARY KEY,
+                    reason TEXT NOT NULL,
+                    metadata TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+        finally:
+            conn.close()
+        _DB_INITIALIZED = True
+
+
+def get_db_connection() -> sqlite3.Connection:
+    init_skip_db()
+    return sqlite3.connect(str(SKIP_DB_PATH), timeout=30)
+
+
+def record_skipped_file(file_path: Path, reason: str, metadata: dict[str, Any]) -> None:
+    payload = json.dumps(metadata, separators=(",", ":"), sort_keys=True)
+    with get_db_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO skipped_transcodes (file_path, reason, metadata, created_at)
+            VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(file_path) DO UPDATE SET
+                reason=excluded.reason,
+                metadata=excluded.metadata,
+                created_at=CURRENT_TIMESTAMP
+            """,
+            (str(file_path), reason, payload),
+        )
+
+
+def load_skip_record(file_path: Path) -> dict[str, Any] | None:
+    with get_db_connection() as conn:
+        row = conn.execute(
+            "SELECT reason, metadata FROM skipped_transcodes WHERE file_path = ?",
+            (str(file_path),),
+        ).fetchone()
+    if not row:
+        return None
+    try:
+        metadata = json.loads(row[1]) if row[1] else {}
+    except json.JSONDecodeError:  # pragma: no cover - defensive
+        metadata = {}
+    return {"reason": row[0], "metadata": metadata}
+
+
+def delete_skip_record(file_path: Path) -> None:
+    with get_db_connection() as conn:
+        conn.execute(
+            "DELETE FROM skipped_transcodes WHERE file_path = ?",
+            (str(file_path),),
+        )
+
+
+def clear_skip_records() -> None:
+    with get_db_connection() as conn:
+        conn.execute("DELETE FROM skipped_transcodes")
+
+
+def probe_subtitle_streams(file_path: str) -> list[dict[str, Any]]:
+    command = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-print_format",
+        "json",
+        "-analyzeduration",
+        "50G",
+        "-probesize",
+        "50M",
+        "-select_streams",
+        "s",
+        "-show_entries",
+        "stream=index,codec_name,codec_type:stream_tags=language,title",
+        file_path,
+    ]
+    print(" ".join(command))
+    result = subprocess.run(command, capture_output=True, text=True, check=True)
+    out = result.stdout.strip()
+    if not out:
+        return []
+    data = json.loads(out)
+    print("FFprobe stream info:")
+    print(json.dumps(data, indent=4))
+    return data.get("streams", [])
+
+
+def file_signature(file_path: Path) -> dict[str, int]:
+    stat = file_path.stat()
+    return {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+
+
+def _matches_signature(metadata: dict[str, Any], signature: dict[str, int]) -> bool:
+    return (
+        metadata.get("size") == signature["size"]
+        and metadata.get("mtime_ns") == signature["mtime_ns"]
+    )
+
+
+def should_skip_due_to_text_subtitles(file_path: Path) -> bool:
+    try:
+        signature = file_signature(file_path)
+    except FileNotFoundError:
+        return False
+
+    record = load_skip_record(file_path)
+    cached_meta = (record or {}).get("metadata", {})
+    if cached_meta and _matches_signature(cached_meta, signature):
+        return True
+
+    try:
+        streams = probe_subtitle_streams(str(file_path))
+    except subprocess.CalledProcessError as exc:
+        print(f"Failed to probe subtitles for {file_path}: {exc}")
+        return False
+
+    if not streams:
+        if record:
+            delete_skip_record(file_path)
+        return False
+
+    text_codecs: list[str] = []
+    non_text = False
+    for stream in streams:
+        codec_name = str(stream.get("codec_name", "")).lower()
+        if codec_name in TEXT_BASED_SUBTITLE_CODECS:
+            text_codecs.append(codec_name)
+        else:
+            non_text = True
+
+    if text_codecs and not non_text:
+        metadata = {**signature, "codecs": sorted(set(text_codecs))}
+        record_skipped_file(file_path, SKIP_REASON_TEXT, metadata)
+        pretty_codecs = ", ".join(metadata["codecs"])
+        print(
+            f"Skipping transcode for {file_path.name}: detected browser-readable subtitles ({pretty_codecs})."
+        )
+        return True
+
+    if record:
+        delete_skip_record(file_path)
+    return False
 
 
 def handle_shutdown(signum, frame) -> None:  # pyright: ignore[reportUnknownParameterType]
@@ -100,6 +283,8 @@ def main():
     except FileNotFoundError:
         print("FFmpeg not found!")
         sys.exit(1)
+
+    init_skip_db()
 
     # Setup metrics
     current_state.state("idle")
@@ -157,12 +342,14 @@ def main():
 def process_new() -> bool:
     # Get all files that need to be processed
     all = get_all_files()
-    to_process = remove_files_if_procesed(all)
+    to_process, skipped_files = remove_files_if_procesed(all)
 
     # Update metrics
     total_files.set(len(all))
     total_files_to_process.set(len(to_process))
-    total_files_transcoded.set(len(all) - len(to_process))
+    total_files_skipped.set(len(skipped_files))
+    processed_count = len(all) - len(to_process) - len(skipped_files)
+    total_files_transcoded.set(processed_count)
 
     if len(to_process) >= 1 and not shutdown_event.is_set():
         print(f"Found {len(to_process)} files to process.")
@@ -348,38 +535,11 @@ def ffmpeg_filtergraph(command: list[str]):
 
 
 def get_stream_info(file_path: str) -> list[str]:
-    command = [
-        "ffprobe",
-        "-v",
-        "error",
-        "-print_format",
-        "json",
-        "-analyzeduration",
-        "50G",
-        "-probesize",
-        "50M",
-        "-select_streams",
-        "s",
-        "-show_entries",
-        "stream=index:stream_tags=language,title",
-        file_path,
-    ]
-    print(" ".join(command))
-    result = subprocess.run(command, capture_output=True, text=True, check=True)
-    if result.returncode != 0:
-        raise Exception(f"FFprobe error: {result.stderr}")
-    out = result.stdout.strip().split("\n")
+    try:
+        streams = probe_subtitle_streams(file_path)
+    except subprocess.CalledProcessError as exc:  # pragma: no cover - ffprobe failure
+        raise Exception(f"FFprobe error: {exc.stderr}") from exc
 
-    # Ignore empty result
-    if len(out) < 1:
-        return []
-
-    data = json.loads("\n".join(out))
-    # Pretty print
-    print("FFprobe stream info:")
-    print(json.dumps(data, indent=4))
-
-    streams = data.get("streams", [])
     # keep only streams that don't contain unwanted tags
     streams = [
         s
@@ -401,7 +561,13 @@ def get_stream_info(file_path: str) -> list[str]:
         )
     )
 
-    return [s.get("index") for s in streams]
+    result_streams: list[str] = []
+    for stream in streams:
+        index = stream.get("index")
+        if index is None:
+            continue
+        result_streams.append(str(index))
+    return result_streams
 
 
 # Process a single file
@@ -462,16 +628,26 @@ def get_all_transcoded_files(all_files: list[Path]) -> list[Path]:
 
 
 # Remove files that have already been processed
-def remove_files_if_procesed(file_list: list[Path]) -> list[Path]:
+def remove_files_if_procesed(file_list: list[Path]) -> tuple[list[Path], list[Path]]:
     unprocessed_files: list[Path] = []
+    skipped_files: list[Path] = []
     for file_path in file_list:
         dir_name = file_path.parent
         name = file_path.stem.removesuffix(ENDING_ORG)
         processed_name = f"{name}{ENDING}.{TARGET_FROMAT}"
         processed_path = dir_name / processed_name
-        if not processed_path.exists():
-            unprocessed_files.append(file_path)
-    return unprocessed_files
+        if processed_path.exists():
+            continue
+
+        try:
+            if should_skip_due_to_text_subtitles(file_path):
+                skipped_files.append(file_path)
+                continue
+        except Exception as exc:  # pragma: no cover - defensive logging
+            print(f"Failed to evaluate subtitles for {file_path}: {exc}")
+
+        unprocessed_files.append(file_path)
+    return unprocessed_files, skipped_files
 
 
 # Update jellyfin registries
@@ -536,6 +712,7 @@ def cleanup_bad_transcodes():
 
 
 if __name__ == "__main__":
+    init_skip_db()
     # main.py delete
     if len(sys.argv) > 1 and sys.argv[1] == "delete":
         print("Finding all transcoded files for delition ...")
@@ -554,6 +731,17 @@ if __name__ == "__main__":
             delete_transcode(file_path)
         print("Deletion complete.")
         sys.exit(0)
+    if len(sys.argv) > 1 and sys.argv[1] == "clear-db":
+        print("This will remove all skip-tracking records.")
+        print(f"Database path: {SKIP_DB_PATH}")
+        print("Press y to continue...")
+        confirmation = input().strip().lower()
+        if confirmation != "y":
+            print("Aborting DB clear.")
+            sys.exit(0)
+        clear_skip_records()
+        print("Skip-tracking table cleared.")
+        sys.exit(0)
     # main.py list
     if len(sys.argv) > 1 and sys.argv[1] == "list":
         print("Finding all transcoded files ...")
@@ -569,4 +757,5 @@ if __name__ == "__main__":
     print("Input Directory:", INPUT_DIR)
     print("Run `main.py delete` to delete all transcoded files.")
     print("Run `main.py list` to list all transcoded files.")
+    print("Run `main.py clear-db` to remove skip-tracking metadata.")
     main()
