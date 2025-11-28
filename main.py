@@ -325,7 +325,6 @@ def main():
 
     while not shutdown_event.is_set():
         processed_file = process_new()
-        ensure_metrics_server_started()
         if processed_file:
             # Update Jellyfin
             if JELLYFIN_API != "":
@@ -380,7 +379,9 @@ def process_new() -> bool:
     total_files_skipped.set(len(skipped_files))
     processed_count = len(all) - len(to_process) - len(skipped_files)
     total_files_transcoded.set(processed_count)
+
     metrics_ready.set()
+    ensure_metrics_server_started()
 
     if len(to_process) >= 1 and not shutdown_event.is_set():
         print(f"Found {len(to_process)} files to process.")
