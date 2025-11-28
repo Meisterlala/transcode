@@ -73,6 +73,10 @@ current_state = Enum(
 )
 current_file = Info("transcode_current_file", "File currently being processed")
 
+# Metrics readiness tracking
+metrics_ready = threading.Event()
+metrics_server_started = False
+
 # Shutdown coordination
 shutdown_event = threading.Event()
 current_ffmpeg_process = None
@@ -158,6 +162,17 @@ def delete_skip_record(file_path: Path) -> None:
 def clear_skip_records() -> None:
     with get_db_connection() as conn:
         conn.execute("DELETE FROM skipped_transcodes")
+
+
+def ensure_metrics_server_started() -> None:
+    global metrics_server_started
+    if metrics_server_started or METRICS_PORT <= 0:
+        return
+    if not metrics_ready.is_set():
+        return
+    _ = start_http_server(METRICS_PORT)
+    metrics_server_started = True
+    print(f"Prometheus metrics server started on port {METRICS_PORT}")
 
 
 def probe_subtitle_streams(
@@ -283,8 +298,9 @@ def main():
 
     # Start Prometheus metrics server
     if METRICS_PORT > 0:
-        _ = start_http_server(METRICS_PORT)
-        print(f"Prometheus metrics server started on port {METRICS_PORT}")
+        print(
+            f"Prometheus metrics server will start after initial scan on port {METRICS_PORT}"
+        )
     else:
         print("Prometheus metrics server disabled (METRICS_PORT <= 0)")
 
@@ -308,7 +324,9 @@ def main():
         print("Failed to cleanup bad transcodes on startup.")
 
     while not shutdown_event.is_set():
-        if process_new():
+        processed_file = process_new()
+        ensure_metrics_server_started()
+        if processed_file:
             # Update Jellyfin
             if JELLYFIN_API != "":
                 print("Updating Jellyfin libraries...")
@@ -362,6 +380,7 @@ def process_new() -> bool:
     total_files_skipped.set(len(skipped_files))
     processed_count = len(all) - len(to_process) - len(skipped_files)
     total_files_transcoded.set(processed_count)
+    metrics_ready.set()
 
     if len(to_process) >= 1 and not shutdown_event.is_set():
         print(f"Found {len(to_process)} files to process.")
