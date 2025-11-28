@@ -42,6 +42,7 @@ TEXT_BASED_SUBTITLE_CODECS = {
     "text",
 }
 SKIP_REASON_TEXT = "text_subtitles_present"
+SCAN_REASON_TRANSCODE = "requires_transcode"
 
 ENDING = " - Transcoded"
 ENDING_ORG = " - Original"
@@ -115,7 +116,7 @@ def get_db_connection() -> sqlite3.Connection:
     return sqlite3.connect(str(SKIP_DB_PATH), timeout=30)
 
 
-def record_skipped_file(file_path: Path, reason: str, metadata: dict[str, Any]) -> None:
+def record_file_decision(file_path: Path, reason: str, metadata: dict[str, Any]) -> None:
     payload = json.dumps(metadata, separators=(",", ":"), sort_keys=True)
     with get_db_connection() as conn:
         conn.execute(
@@ -207,8 +208,12 @@ def should_skip_due_to_text_subtitles(file_path: Path) -> bool:
 
     record = load_skip_record(file_path)
     cached_meta = (record or {}).get("metadata", {})
+    cached_reason = (record or {}).get("reason")
     if cached_meta and _matches_signature(cached_meta, signature):
-        return True
+        if cached_reason == SKIP_REASON_TEXT:
+            return True
+        if cached_reason == SCAN_REASON_TRANSCODE:
+            return False
 
     try:
         streams = probe_subtitle_streams(str(file_path))
@@ -217,8 +222,7 @@ def should_skip_due_to_text_subtitles(file_path: Path) -> bool:
         return False
 
     if not streams:
-        if record:
-            delete_skip_record(file_path)
+        record_file_decision(file_path, SCAN_REASON_TRANSCODE, signature)
         return False
 
     text_codecs: list[str] = []
@@ -231,16 +235,18 @@ def should_skip_due_to_text_subtitles(file_path: Path) -> bool:
             non_text = True
 
     if text_codecs and not non_text:
-        metadata = {**signature, "codecs": sorted(set(text_codecs))}
-        record_skipped_file(file_path, SKIP_REASON_TEXT, metadata)
+        metadata: dict[str, Any] = {**signature, "codecs": sorted(set(text_codecs))}
+        record_file_decision(file_path, SKIP_REASON_TEXT, metadata)
         pretty_codecs = ", ".join(metadata["codecs"])
         print(
             f"Skipping transcode for {file_path.name}: detected browser-readable subtitles ({pretty_codecs})."
         )
         return True
 
-    if record:
-        delete_skip_record(file_path)
+    metadata: dict[str, Any] = {**signature}
+    if text_codecs:
+        metadata["codecs"] = sorted(set(text_codecs))
+    record_file_decision(file_path, SCAN_REASON_TRANSCODE, metadata)
     return False
 
 
