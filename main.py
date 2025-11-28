@@ -232,7 +232,7 @@ def run_ffmpeg_vaapi(
         "-probesize",
         "20M",  # increase probe size
         "-init_hw_device",
-        "vaapi=va:/dev/dri/renderD129",  # Initialize VAAPI device
+        f"vaapi=va:{VAAPI_RENDER_DEVICE}",  # Initialize VAAPI device
         # "-hwaccel",
         # "vaapi",  # Use VAAPI hardware acceleration for decoding
         # "-hwaccel_device",
