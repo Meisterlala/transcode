@@ -7,6 +7,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 from pathlib import Path
 
 import requests
@@ -32,6 +33,11 @@ ENDING_ORG = " - Original"
 TARGET_FROMAT = "mkv"
 ALLOWED_EXTENSIONS = ["mp4", "mkv"]
 DISALLOWED_ENDINGS = [ENDING]
+
+
+SUBTITLE_LIMIT = 3
+# Subtitles to remove
+REMOVE_SUBTITLES = ["sing", "song"]
 
 # Prometheus metrics
 total_files = Gauge("transcode_total_files", "Total number of files that exist")
@@ -74,6 +80,11 @@ def install_signal_handlers():
 
 
 def main():
+    # Check if VAAPI render device exists
+    if not Path(VAAPI_RENDER_DEVICE).exists():
+        print(f"VAAPI render device {VAAPI_RENDER_DEVICE} not found!")
+        sys.exit(1)
+
     # Start Prometheus metrics server
     if METRICS_PORT > 0:
         _ = start_http_server(METRICS_PORT)
@@ -162,11 +173,10 @@ def process_new() -> bool:
 
 
 # Execute ffmpeg
-def run_ffmpeg(
+def run_ffmpeg_vaapi(
     input_path: str,
     output_path: str,
-    subtitle_limit: int = 0,
-    termination_timeout: int = 15,
+    subtitle_limit: int = SUBTITLE_LIMIT,
 ):
     filters: list[str] = []
     maps: list[str] = []
@@ -175,22 +185,13 @@ def run_ffmpeg(
         streams = get_stream_info(input_path)
         streams = streams[:subtitle_limit]  # Limit number of subtitles
         print("Subtitle streams found:", streams)
-        # 1. SPLIT (Hardware)
-        # outputs = "".join([f"[base_hw{i}]" for i in range(len(streams))])
-        # filters.append(f"[0:v]split={len(streams)}{outputs}")
-
-        # 2. MAP, OVERLAY & UPLOAD
+        # Split
+        # filters.append(
+        #     f"[0:v]split={len(streams)}{''.join(f'[split{i}]' for i in range(len(streams)))}"
+        # )
         for i, sub_index in enumerate(streams):
-            # The Pipeline:
-            # scale_vaapi=format=nv12  -> VITAL: GPU converts 10-bit to 8-bit here.
-            #                             Prevents 'Failed to map frame: -22' error.
-            # hwmap=...                -> Zero-copy map to CPU.
-            # overlay                  -> Burn subtitle (Creates NEW frame, breaking the map).
-            # hwupload                 -> Upload new frame to GPU.
-
             chain = (
-                f"[base_hw{i}]hwdownload,format=nv12[base_soft{i}];"
-                f"[base_soft{i}][0:{sub_index}]overlay[burned_{i}];"
+                f"[0:v][0:{sub_index}]overlay[burned_{i}];"
                 f"[burned_{i}]format=nv12,hwupload[v_out{i}]"
             )
             filters.append(chain)
@@ -205,53 +206,70 @@ def run_ffmpeg(
     )
     print("Filter complex:", filter_complex)
 
-    # if file path contains "anime", tune for anime
-    tune = "animation" if "anime" in input_path.lower() else "film"
+    # Figure out compression_level
+    def compression_level() -> int:  # type: ignore
+        vbaq = 16
+        pre_encode = 8
+        quality_preset = 4
+        balanced_preset = 2
+        speed_preset = 0
+
+        level = vbaq + speed_preset
+        level = (level << 1) | 1  # Set validity bit
+        return level
 
     command = [
         "ffmpeg",
         "-hide_banner",  # suppress banner
         "-stats_period",
-        "3",  # Only show stats periodically
+        "5",  # Only show stats periodically
         "-progress",
         "pipe:1",  # progress to stdout
         "-nostats",  # suppress periodic stats, we use the progress for that
         "-analyzeduration",
-        "50G",  # increase analyze duration
+        "20G",  # increase analyze duration
         "-probesize",
-        "50M",  # increase probe size
+        "20M",  # increase probe size
         "-init_hw_device",
         "vaapi=va:/dev/dri/renderD129",  # Initialize VAAPI device
-        "-hwaccel",
-        "vaapi",  # Use VAAPI hardware acceleration
-        "-hwaccel_device",
-        "va",
+        # "-hwaccel",
+        # "vaapi",  # Use VAAPI hardware acceleration for decoding
+        # "-hwaccel_device",
+        # "va", # Use VAAPI device for filters
         "-hwaccel_output_format",
         "vaapi",  # Use VAAPI for hwaccel output
         "-i",
         input_path,
-        "-filter_hw_device",
-        "va",  # Use VAAPI device for filters
+        # "-filter_hw_device",
+        # "va",  # Use VAAPI device for filters
         *filter_complex,  # Add filters
         *maps,  # video map
         "-map",
         "0:a",  # all audio streams
         "-c:v",
         "hevc_vaapi",  # Video Encoder
-        # "-global_quality",
-        # "50",
-        # "-rc_mode",
-        # "ICQ",  #
-        # "-preset",
-        # "superfast",  # speed vs quality
-        # "-c:a",
-        # "libvorbis",  # Audio Encoder
-        # "-tune",
-        # tune,
+        "-qp",  # Constant Quality
+        "22",  # Lower => better quality
+        "-rc_mode",
+        "CQP",  #
+        "-compression_level",
+        str(compression_level()),  # Higher => faster
+        "-c:a",
+        "libvorbis",  # Audio Encoder
+        # "-t",
+        # "00:02:00",  # Limit to first 30 minutes for testing
         output_path,
     ]
     print(" ".join(command))
+    # ffmpeg_filtergraph(command)
+    start_ffmpeg_process(command)
 
+
+def start_ffmpeg_process(
+    command: list[str],
+    termination_timeout: int = 15,
+) -> None:
+    """Start ffmpeg process and handle graceful shutdown."""
     global current_ffmpeg_process
     # Start ffmpeg in a new process group so we can terminate the whole group if needed
     current_ffmpeg_process = subprocess.Popen(
@@ -261,8 +279,6 @@ def run_ffmpeg(
         env={**os.environ, "LIBVA_DRIVER_NAME": "radeonsi"},
     )
     try:
-        start_time = time.time()
-        # Poll loop so we can react to shutdown_event
         while True:
             if shutdown_event.is_set():
                 if current_ffmpeg_process.poll() is None:
@@ -296,12 +312,38 @@ def run_ffmpeg(
             if ret is not None:
                 break
             time.sleep(1)
-
         ret_code = current_ffmpeg_process.returncode
         if ret_code != 0:
             raise Exception(f"FFmpeg exited with non-zero status {ret_code}")
     finally:
         current_ffmpeg_process = None
+
+
+def ffmpeg_filtergraph(command: list[str]):
+    """Extract filtergraph from ffmpeg command for logging."""
+    # Extract input -i file
+    input: list[str] = command[0 : command.index("-i") + 2]
+    # Extract filter_complex
+    filter_complex: str = command[command.index("-filter_complex") + 1]
+    print(input, filter_complex)
+
+    result = subprocess.run(
+        [
+            *input,
+            "-filter_complex",
+            filter_complex,
+            "-f",
+            "graphviz",
+            "-loglevel",
+            "debug",
+            "pipe:1",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise Exception(f"FFmpeg filtergraph error: {result.stderr}")
+    print(result.stdout)
 
 
 def get_stream_info(file_path: str) -> list[str]:
@@ -316,7 +358,7 @@ def get_stream_info(file_path: str) -> list[str]:
         "-select_streams",
         "s",
         "-show_entries",
-        "stream=index:stream_tags=language",
+        "stream=index:stream_tags=language,title",
         "-of",
         "default=noprint_wrappers=1:nokey=1",
         file_path,
@@ -328,20 +370,27 @@ def get_stream_info(file_path: str) -> list[str]:
     print(result.stdout)
     out = result.stdout.strip().split("\n")
 
-    # If odd number of lines, something went wrong
-    if len(out) % 2 != 0:
-        return out if out else []
+    # Ignore empty result
+    if len(out) < 3:
+        return []
 
-    # Sort by language tag (prefer eng)
-    combined: list[tuple[str, str]] = []
-    for i in range(0, len(out), 2):
+    # Build tuples of (index, language, title)
+    combined: list[tuple[str, str, str]] = []
+    for i in range(0, len(out), 3):
         index = out[i]
         language = out[i + 1]
-        combined.append((index, language))
+        title = out[i + 2]
+        combined.append((index, language, title))
+
+    # Remove sing/song stuff
+    combined = [
+        t for t in combined if not any(rem in t[2].lower() for rem in REMOVE_SUBTITLES)
+    ]
 
     # Sort so that "eng" comes first
     combined.sort(key=lambda x: 0 if x[1] == "eng" else 1 if x[1] == "und" else 2)
-    out = [index for index, _ in combined]
+
+    out = [index for index, _, _ in combined]
 
     return out if out else []
 
@@ -356,7 +405,7 @@ def process_file(file_path: Path):
         output_name = f"{name}{ENDING}.{TARGET_FROMAT}"
         output_path = dir_name / output_name
         print("===================== Processing started ======================")
-        run_ffmpeg(str(file_path), str(output_path))
+        run_ffmpeg_vaapi(str(file_path), str(output_path))
         print("===================== Finished processing =====================")
     except InterruptedError:
         print("Processing interrupted. Cleaning partial transcode...")
@@ -366,6 +415,7 @@ def process_file(file_path: Path):
         delete_transcode(file_path)
         sys.exit(1)
     except BaseException as e:
+        traceback.print_exc()
         print(f"Error processing file {file_path}:\n\t {e}")
         delete_transcode(file_path)
     finally:
