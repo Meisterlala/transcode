@@ -469,7 +469,7 @@ def run_ffmpeg_vaapi(
         "-c:v",
         "hevc_vaapi",  # Video Encoder
         "-qp",  # Constant Quality
-        "22",  # Lower => better quality
+        "25",  # Lower => better quality
         "-rc_mode",
         "CQP",  #
         "-compression_level",
