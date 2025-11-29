@@ -476,6 +476,8 @@ def run_ffmpeg_vaapi(
         str(compression_level()),  # Higher => faster
         "-c:a",
         "libvorbis",  # Audio Encoder
+        "-fflags",
+        "+genpts",  # Generate PTS if missing
         # "-t",
         # "00:02:00",  # Limit to first 30 minutes for testing
         output_path,
