@@ -5,3 +5,4 @@ __pycache__/
 
 in_test/
 *.sqlite3
+*.sqlite3*

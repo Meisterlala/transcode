@@ -772,7 +772,7 @@ def probe_duration_seconds(file_path: Path) -> float | None:
         return float(raw)
     except ValueError:
         print(f"Unable to parse duration for {file_path}: '{raw}'")
-        return None
+        return 60 * 60 * 999  # 999 hours
 
 
 def clean_bad_transcodes(limit_seconds: int = MAX_TRANSCODE_DURATION_SECONDS) -> None:
@@ -784,7 +784,6 @@ def clean_bad_transcodes(limit_seconds: int = MAX_TRANSCODE_DURATION_SECONDS) ->
     flagged: list[tuple[Path, float]] = []
     for transcode_path in transcoded:
         duration = probe_duration_seconds(transcode_path)
-        print(duration)
         if duration is None:
             continue
         if duration > limit_seconds:
