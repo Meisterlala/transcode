@@ -483,6 +483,9 @@ def run_ffmpeg_vaapi(
         "libvorbis",  # Audio Encoder
         "-fflags",
         "+genpts",  # Generate PTS if missing
+        "-avoid_negative_ts",
+        "make_zero",  # Avoid negative timestamps
+        "-shortest:v",  # Cut to shortest stream (avoid hanging on subtitles)
         # "-t",
         # "00:02:00",  # Limit to first 30 minutes for testing
         output_path,
