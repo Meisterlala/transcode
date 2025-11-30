@@ -53,6 +53,11 @@ SUBTITLE_LIMIT = 3
 # Subtitles to remove
 REMOVE_SUBTITLES = ["sing", "song"]
 
+
+MAX_TRANSCODE_DURATION_SECONDS = int(
+    os.environ.get("MAX_TRANSCODE_DURATION_SECONDS", str(10 * 60 * 60))
+)
+
 # Prometheus metrics
 total_files = Gauge("transcode_total_files", "Total number of files that exist")
 total_files_to_process = Gauge(
@@ -745,6 +750,76 @@ def cleanup_bad_transcodes():
             processed_path.unlink()
 
 
+def probe_duration_seconds(file_path: Path) -> float | None:
+    """Return the media duration in seconds using ffprobe."""
+    command = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        str(file_path),
+    ]
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, check=True)
+    except subprocess.CalledProcessError as exc:
+        print(f"Failed to probe duration for {file_path}: {exc.stderr or exc}")
+        return None
+    raw = result.stdout.strip()
+    try:
+        return float(raw)
+    except ValueError:
+        print(f"Unable to parse duration for {file_path}: '{raw}'")
+        return None
+
+
+def clean_bad_transcodes(limit_seconds: int = MAX_TRANSCODE_DURATION_SECONDS) -> None:
+    print("Scanning for suspiciously long transcoded files...")
+    all_files = get_all_files()
+    transcoded = sorted(
+        {path.resolve() for path in get_all_transcoded_files(all_files)}
+    )
+    flagged: list[tuple[Path, float]] = []
+    for transcode_path in transcoded:
+        duration = probe_duration_seconds(transcode_path)
+        print(duration)
+        if duration is None:
+            continue
+        if duration > limit_seconds:
+            flagged.append((transcode_path, duration))
+
+    hours_limit = limit_seconds / 3600
+    if not flagged:
+        print(
+            f"No transcoded files exceeded {hours_limit:.2f} hours. Nothing to clean."
+        )
+        return
+
+    print(f"Found {len(flagged)} transcoded files exceeding {hours_limit:.2f} hours:")
+    for file_path, duration in flagged:
+        print(f" - {file_path} ({duration / 3600:.2f} hours)")
+
+    confirmation = input("Delete these files? Type 'y' to confirm: ").strip().lower()
+    if confirmation != "y":
+        print("Aborting clean. No files were deleted.")
+        return
+
+    deleted = 0
+    for file_path, _ in flagged:
+        try:
+            file_path.unlink()
+            deleted += 1
+            print(f"Deleted {file_path}")
+        except FileNotFoundError:
+            print(f"File already missing, skipping: {file_path}")
+        except Exception as exc:
+            print(f"Failed to delete {file_path}: {exc}")
+
+    print(f"Clean complete. Deleted {deleted} files.")
+
+
 if __name__ == "__main__":
     init_skip_db()
     # main.py delete
@@ -786,10 +861,17 @@ if __name__ == "__main__":
         for file_path in transcoded:
             print(f" - {file_path.name}")
         sys.exit(0)
+    if len(sys.argv) > 1 and sys.argv[1] == "clean":
+        clean_bad_transcodes()
+        sys.exit(0)
 
     print("Starting transcoder...")
     print("Input Directory:", INPUT_DIR)
     print("Run `main.py delete` to delete all transcoded files.")
     print("Run `main.py list` to list all transcoded files.")
     print("Run `main.py clear-db` to remove skip-tracking metadata.")
+    print(
+        "Run `main.py clean` to remove transcoded files longer than"
+        f" {MAX_TRANSCODE_DURATION_SECONDS / 3600:.0f} hours."
+    )
     main()
