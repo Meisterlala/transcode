@@ -346,6 +346,7 @@ def main():
         else:
             # Interruptible longer sleep (60s)
             print("No files to process. Sleeping for 60 seconds...")
+            current_state.state("idle")
             for _ in range(600):  # 600 * 0.1 = 60s
                 if shutdown_event.is_set():
                     break
@@ -642,6 +643,7 @@ def process_file(file_path: Path):
         total_files_transcoded.inc()
         current_state.state("idle")
         current_file.info({"file": ""})
+    current_state.state("idle")
 
 
 # Scan "INPUT_DIR" for all files
