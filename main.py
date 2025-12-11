@@ -116,7 +116,6 @@ def init_skip_db() -> None:
         except Exception as exc:
             print("Failed to initialize skip DB:", exc)
             print("Removing potentially corrupt DB file.")
-            conn.close()
             try:
                 DB_PATH.unlink()
             except Exception as rm_exc:
@@ -124,7 +123,6 @@ def init_skip_db() -> None:
 
             raise
         finally:
-            conn.close()
         _DB_INITIALIZED = True
 
 
