@@ -100,8 +100,8 @@ def init_skip_db() -> None:
         db_parent = DB_PATH.parent
         if not db_parent.exists():
             db_parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(str(DB_PATH), timeout=30)
         try:
+            conn = sqlite3.connect(str(DB_PATH), timeout=30)
             conn.execute("PRAGMA journal_mode=WAL;")
             conn.execute(
                 """
@@ -113,6 +113,16 @@ def init_skip_db() -> None:
                 )
                 """
             )
+        except Exception as exc:
+            print("Failed to initialize skip DB:", exc)
+            print("Removing potentially corrupt DB file.")
+            conn.close()
+            try:
+                DB_PATH.unlink()
+            except Exception as rm_exc:
+                print("Failed to remove DB file:", rm_exc)
+
+            raise
         finally:
             conn.close()
         _DB_INITIALIZED = True
