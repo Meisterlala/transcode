@@ -58,6 +58,18 @@ MAX_TRANSCODE_DURATION_SECONDS = int(
     os.environ.get("MAX_TRANSCODE_DURATION_SECONDS", str(10 * 60 * 60))
 )
 
+# Minimum acceptable overlap between original and transcoded durations.
+# overlap = min(orig, trans) / max(orig, trans)
+MIN_DURATION_OVERLAP_RATIO = float(os.environ.get("MIN_DURATION_OVERLAP_RATIO", "0.90"))
+
+# Before starting a transcode, ensure the file isn't still being copied/written.
+FILE_SIZE_STABILITY_INTERVAL_SECONDS = int(
+    os.environ.get("FILE_SIZE_STABILITY_INTERVAL_SECONDS", "5")
+)
+FILE_SIZE_STABILITY_THRESHOLD_BYTES = int(
+    os.environ.get("FILE_SIZE_STABILITY_THRESHOLD_BYTES", str(1024))
+)
+
 # Prometheus metrics
 total_files = Gauge("transcode_total_files", "Total number of files that exist")
 total_files_to_process = Gauge(
@@ -120,9 +132,7 @@ def init_skip_db() -> None:
                 DB_PATH.unlink()
             except Exception as rm_exc:
                 print("Failed to remove DB file:", rm_exc)
-
-            raise
-        finally:
+                sys.exit(1)
         _DB_INITIALIZED = True
 
 
@@ -347,7 +357,7 @@ def main():
                 except Exception as e:
                     print("Failed to update Jellyfin libraries.", e)
             # Short sleep if a file was processed
-            for _ in range(10):  # interruptible sleep (10 * 0.1 = 1s)
+            for _ in range(100):  # interruptible sleep (100 * 0.1 = 10s)
                 if shutdown_event.is_set():
                     break
                 time.sleep(0.1)
@@ -412,6 +422,8 @@ def run_ffmpeg_vaapi(
     output_path: str,
     subtitle_limit: int = SUBTITLE_LIMIT,
 ):
+    _wait_for_file_size_stability(Path(input_path))
+
     filters: list[str] = []
     maps: list[str] = []
 
@@ -502,6 +514,45 @@ def run_ffmpeg_vaapi(
     print(" ".join(command))
     # ffmpeg_filtergraph(command)
     start_ffmpeg_process(command)
+
+
+def _wait_for_file_size_stability(
+    file_path: Path,
+    interval_seconds: int = FILE_SIZE_STABILITY_INTERVAL_SECONDS,
+    threshold_bytes: int = FILE_SIZE_STABILITY_THRESHOLD_BYTES,
+) -> None:
+    """Block until file size remains stable within threshold over one interval."""
+    if interval_seconds <= 0:
+        return
+
+    while not shutdown_event.is_set():
+        try:
+            size1 = file_path.stat().st_size
+        except FileNotFoundError:
+            return
+        except Exception as exc:  # pragma: no cover - defensive
+            print(f"Failed to stat {file_path} for stability check: {exc}")
+            return
+
+        for _ in range(interval_seconds * 10):  # interruptible sleep
+            if shutdown_event.is_set():
+                return
+            time.sleep(0.1)
+
+        try:
+            size2 = file_path.stat().st_size
+        except FileNotFoundError:
+            return
+        except Exception as exc:  # pragma: no cover - defensive
+            print(f"Failed to stat {file_path} for stability check: {exc}")
+            return
+
+        if abs(size2 - size1) <= threshold_bytes:
+            return
+
+        print(
+            f"Input file still changing (Δ{abs(size2 - size1)} bytes > {threshold_bytes}); waiting {interval_seconds}s: {file_path.name}"
+        )
 
 
 def start_ffmpeg_process(
@@ -788,30 +839,103 @@ def probe_duration_seconds(file_path: Path) -> float | None:
         return 60 * 60 * 999  # 999 hours
 
 
-def clean_bad_transcodes(limit_seconds: int = MAX_TRANSCODE_DURATION_SECONDS) -> None:
-    print("Scanning for suspiciously long transcoded files...")
+def duration_overlap_ratio(original_seconds: float, transcoded_seconds: float) -> float:
+    """Return overlap ratio in [0, 1] where 1 means equal durations."""
+    if original_seconds <= 0 or transcoded_seconds <= 0:
+        return 0.0
+    shorter = min(original_seconds, transcoded_seconds)
+    longer = max(original_seconds, transcoded_seconds)
+    if longer <= 0:
+        return 0.0
+    return shorter / longer
+
+
+def find_original_for_transcode(transcoded_path: Path, all_files: list[Path]) -> Path | None:
+    """Find the original input file corresponding to a given transcoded file."""
+    # Normalize stem back to the base "name" used in transcode naming.
+    # Originals may be named either "<name> - Original.ext" or "<name>.ext".
+    stem = transcoded_path.stem
+    if stem.endswith(ENDING):
+        base = stem[: -len(ENDING)]
+    else:
+        base = stem
+
+    candidates: list[Path] = []
+    for src in all_files:
+        src_stem = src.stem
+        if src_stem == base or src_stem == f"{base}{ENDING_ORG}":
+            candidates.append(src)
+
+    if not candidates:
+        return None
+    if len(candidates) == 1:
+        return candidates[0]
+    # Prefer a file explicitly marked as Original.
+    for c in candidates:
+        if c.stem.endswith(ENDING_ORG):
+            return c
+    return candidates[0]
+
+
+def clean_bad_transcodes(
+    limit_seconds: int = MAX_TRANSCODE_DURATION_SECONDS,
+    min_overlap_ratio: float = MIN_DURATION_OVERLAP_RATIO,
+) -> None:
+    print("Scanning for suspiciously long or mismatched transcoded files...")
     all_files = get_all_files()
     transcoded = sorted(
         {path.resolve() for path in get_all_transcoded_files(all_files)}
     )
-    flagged: list[tuple[Path, float]] = []
+    flagged: list[tuple[Path, str]] = []
     for transcode_path in transcoded:
-        duration = probe_duration_seconds(transcode_path)
-        if duration is None:
+        trans_duration = probe_duration_seconds(transcode_path)
+        if trans_duration is None:
             continue
-        if duration > limit_seconds:
-            flagged.append((transcode_path, duration))
+
+        # 1) Flag transcoded files that are implausibly long.
+        if trans_duration > limit_seconds:
+            flagged.append(
+                (
+                    transcode_path,
+                    f"transcoded duration {trans_duration / 3600:.2f}h exceeds {limit_seconds / 3600:.2f}h",
+                )
+            )
+            continue
+
+        # 2) Flag files where original/transcoded durations diverge too much.
+        original_path = find_original_for_transcode(transcode_path, all_files)
+        if original_path is None:
+            # If we can't find the original, don't delete automatically.
+            continue
+
+        orig_duration = probe_duration_seconds(original_path)
+        if orig_duration is None:
+            continue
+
+        overlap = duration_overlap_ratio(orig_duration, trans_duration)
+        if overlap < min_overlap_ratio:
+            flagged.append(
+                (
+                    transcode_path,
+                    (
+                        f"duration overlap {overlap * 100:.1f}% < {min_overlap_ratio * 100:.1f}% "
+                        f"(orig {orig_duration:.1f}s vs trans {trans_duration:.1f}s)"
+                    ),
+                )
+            )
 
     hours_limit = limit_seconds / 3600
     if not flagged:
         print(
-            f"No transcoded files exceeded {hours_limit:.2f} hours. Nothing to clean."
+            "No transcoded files exceeded duration limits or failed overlap checks. Nothing to clean."
         )
         return
 
-    print(f"Found {len(flagged)} transcoded files exceeding {hours_limit:.2f} hours:")
-    for file_path, duration in flagged:
-        print(f" - {file_path} ({duration / 3600:.2f} hours)")
+    print(
+        f"Found {len(flagged)} candidate transcodes to delete (limit {hours_limit:.2f}h, overlap >= {min_overlap_ratio * 100:.1f}%):"
+    )
+    for file_path, reason in flagged:
+        print(f" - {file_path} ({reason})")
 
     confirmation = input("Delete these files? Type 'y' to confirm: ").strip().lower()
     if confirmation != "y":
