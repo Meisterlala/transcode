@@ -442,15 +442,17 @@ def run_ffmpeg_vaapi(
             )
             filters.append(chain)
             maps.extend(["-map", f"[v_out{i}]"])
-    else:
-        # No subtitles? Just pass the hardware stream through
-        maps.extend(["-map", "0:v"])
 
     # Combine filters
     filter_complex: list[str] = (
         ["-filter_complex", ";".join(filters)] if filters else []
     )
     print("Filter complex:", filter_complex)
+
+    # Change format, even if no subtitles
+    if len(filter_complex) == 0:
+        filter_complex = ["-filter_complex", "[0:v]format=nv12,hwupload[v_out];"]
+        maps.extend(["-map", "[v_out]"])
 
     # Figure out compression_level
     def compression_level() -> int:  # type: ignore
