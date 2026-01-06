@@ -841,6 +841,151 @@ def probe_duration_seconds(file_path: Path) -> float | None:
         return 60 * 60 * 999  # 999 hours
 
 
+def is_valid_video_file(file_path: Path) -> bool:
+    """Return True if ffprobe can parse the container and find a video stream."""
+    command = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=codec_type",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        str(file_path),
+    ]
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, check=True)
+    except FileNotFoundError:
+        print("ffprobe not found; cannot validate files.")
+        raise
+    except subprocess.CalledProcessError as exc:
+        # Avoid duplicate-looking output: ffprobe often includes the file path
+        # and multi-line details in stderr; print it once, clearly.
+        err = (exc.stderr or "").strip()
+        if err:
+            print(f"Invalid media (ffprobe error): {file_path}\n{err}")
+        else:
+            print(f"Invalid media (ffprobe failed): {file_path}")
+        return False
+
+    out = (result.stdout or "").strip().lower()
+    if out != "video":
+        print(f"Invalid media (no video stream): {file_path}")
+        return False
+    return True
+
+
+def delete_related_transcodes_for_original(original_path: Path) -> int:
+    """Delete any transcoded outputs matching the given original."""
+    dir_name = original_path.parent
+    name = original_path.stem.removesuffix(ENDING_ORG)
+    deleted = 0
+    for ext in set([TARGET_FROMAT, *ALLOWED_EXTENSIONS]):
+        candidate = dir_name / f"{name}{ENDING}.{ext}"
+        if candidate.exists():
+            try:
+                candidate.unlink()
+                deleted += 1
+                print(f"Deleted related transcode: {candidate}")
+            except Exception as exc:
+                print(f"Failed to delete related transcode {candidate}: {exc}")
+    return deleted
+
+
+def delete_bad_files() -> None:
+    """Validate originals and transcodes; delete any invalid ones.
+
+    If an original is invalid, also delete its related transcode(s).
+    """
+    print("This will scan ALL originals and transcodes for validity.")
+    confirmation = input("Continue? Type 'y' to scan: ").strip().lower()
+    if confirmation != "y":
+        print("Aborting. No files were scanned or deleted.")
+        return
+
+    all_files = get_all_files()
+    all_originals = sorted({p.resolve() for p in all_files})
+    all_transcoded = sorted({p.resolve() for p in get_all_transcoded_files(all_files)})
+
+    invalid_originals: list[Path] = []
+    invalid_transcodes: list[Path] = []
+    related_transcodes_due_to_invalid_original: list[Path] = []
+
+    # 1) Validate originals.
+    for original in all_originals:
+        if not original.exists():
+            continue
+        if not is_valid_video_file(original):
+            invalid_originals.append(original)
+            # If an original is invalid, mark any matching transcodes for deletion too.
+            dir_name = original.parent
+            name = original.stem.removesuffix(ENDING_ORG)
+            for ext in set([TARGET_FROMAT, *ALLOWED_EXTENSIONS]):
+                candidate = (dir_name / f"{name}{ENDING}.{ext}").resolve()
+                if candidate.exists():
+                    related_transcodes_due_to_invalid_original.append(candidate)
+
+    # 2) Validate transcodes.
+    for transcode in all_transcoded:
+        if not transcode.exists():
+            continue
+        if not is_valid_video_file(transcode):
+            invalid_transcodes.append(transcode)
+
+    # De-duplicate deletion set, and ensure original-linked deletions win.
+    delete_set: dict[Path, str] = {}
+    for p in related_transcodes_due_to_invalid_original:
+        delete_set[p] = "related_transcode_due_to_invalid_original"
+    for p in invalid_transcodes:
+        delete_set.setdefault(p, "invalid_transcode")
+    for p in invalid_originals:
+        delete_set[p] = "invalid_original"
+
+    if not delete_set:
+        print("No invalid files found. Nothing to delete.")
+        return
+
+    print("\nFiles marked for deletion:")
+    for p in sorted(delete_set.keys(), key=lambda x: str(x)):
+        print(f" - {p} ({delete_set[p]})")
+
+    confirmation = input("\nDelete these files? Type 'y' to confirm: ").strip().lower()
+    if confirmation != "y":
+        print("Aborting deletion. No files were deleted.")
+        return
+
+    originals_deleted = 0
+    transcodes_deleted = 0
+    related_deleted = 0
+
+    for p in sorted(delete_set.keys(), key=lambda x: str(x)):
+        reason = delete_set[p]
+        try:
+            p.unlink()
+            if reason == "invalid_original":
+                originals_deleted += 1
+                print(f"Deleted invalid original: {p}")
+            elif reason == "related_transcode_due_to_invalid_original":
+                related_deleted += 1
+                print(f"Deleted related transcode: {p}")
+            else:
+                transcodes_deleted += 1
+                print(f"Deleted invalid transcode: {p}")
+        except FileNotFoundError:
+            print(f"Already missing, skipping: {p}")
+        except Exception as exc:
+            print(f"Failed to delete {p}: {exc}")
+
+    print(
+        "Delete-bad complete: "
+        f"deleted {originals_deleted} invalid original(s), "
+        f"deleted {transcodes_deleted} invalid transcode(s), "
+        f"deleted {related_deleted} related transcode(s) due to invalid originals."
+    )
+
+
 def duration_overlap_ratio(original_seconds: float, transcoded_seconds: float) -> float:
     """Return overlap ratio in [0, 1] where 1 means equal durations."""
     if original_seconds <= 0 or transcoded_seconds <= 0:
@@ -1006,6 +1151,11 @@ if __name__ == "__main__":
         clean_bad_transcodes()
         sys.exit(0)
 
+    if len(sys.argv) > 1 and sys.argv[1] == "delete-bad":
+        print("Validating originals and transcodes; deleting invalid files...")
+        delete_bad_files()
+        sys.exit(0)
+
     print("Starting transcoder...")
     print("Input Directory:", INPUT_DIR)
     print("Run `main.py delete` to delete all transcoded files.")
@@ -1014,5 +1164,8 @@ if __name__ == "__main__":
     print(
         "Run `main.py clean` to remove transcoded files longer than"
         f" {MAX_TRANSCODE_DURATION_SECONDS / 3600:.0f} hours."
+    )
+    print(
+        "Run `main.py delete-bad` to delete invalid original/transcoded files (ffprobe-based check)."
     )
     main()
