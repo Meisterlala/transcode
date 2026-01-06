@@ -850,7 +850,9 @@ def duration_overlap_ratio(original_seconds: float, transcoded_seconds: float) -
     return shorter / longer
 
 
-def find_original_for_transcode(transcoded_path: Path, all_files: list[Path]) -> Path | None:
+def find_original_for_transcode(
+    transcoded_path: Path, all_files: list[Path]
+) -> Path | None:
     """Find the original input file corresponding to a given transcoded file."""
     # Normalize stem back to the base "name" used in transcode naming.
     # Originals may be named either "<name> - Original.ext" or "<name>.ext".
@@ -993,6 +995,7 @@ if __name__ == "__main__":
         all_files = get_all_files()
         print(f"Found {len(all_files)} total files.")
         transcoded = get_all_transcoded_files(all_files)
+        transcoded = sorted({p for p in transcoded}, key=lambda p: p.name)
         print(f"Found {len(transcoded)} transcoded files:")
         for file_path in transcoded:
             print(f" - {file_path.name}")
